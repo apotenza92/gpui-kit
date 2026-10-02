@@ -47,6 +47,8 @@ mod movement;
 mod native;
 #[path = "base/rope_ext.rs"]
 mod rope_ext;
+#[path = "base/rotation.rs"]
+mod rotation;
 #[path = "editor/search.rs"]
 mod search;
 #[path = "base/selection.rs"]
@@ -94,6 +96,8 @@ pub use native::set_text_content_type;
 pub use native::{NativeMenu, NativeMenuItem};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
+pub(crate) use rotation::ResolvedTextareaRotation;
+pub use rotation::TextareaRotation;
 pub use search::{SearchMatcher, SearchSession};
 pub use state::*;
 pub use textarea::{Textarea, TextareaState};

@@ -784,9 +784,15 @@ impl PopupMenu {
                     self = self.separator();
                 }
                 OwnedMenuItem::Submenu(submenu) => {
+                    let submenu_disabled = submenu.disabled;
                     self = self.submenu(submenu.name, window, cx, move |menu, window, cx| {
                         menu.with_menu_items(submenu.items.clone(), window, cx)
-                    })
+                    });
+                    if let Some(PopupMenuItem::Submenu { disabled, .. }) =
+                        self.menu_items.last_mut()
+                    {
+                        *disabled = submenu_disabled;
+                    }
                 }
                 OwnedMenuItem::SystemMenu(_) => {}
             }
@@ -803,7 +809,7 @@ impl PopupMenu {
         if let Some(ix) = self.selected_index {
             if let Some(item) = self.menu_items.get(ix) {
                 return match item {
-                    PopupMenuItem::Submenu { menu, .. } => Some(menu.clone()),
+                    PopupMenuItem::Submenu { menu, disabled: false, .. } => Some(menu.clone()),
                     _ => None,
                 };
             }
@@ -1197,6 +1203,7 @@ impl PopupMenu {
             .rounded(radius)
             .items_center()
             .selected(selected)
+            .checked(item.is_checked())
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 if *hovered {
                     this.selected_index = Some(ix);
@@ -1342,7 +1349,7 @@ impl PopupMenu {
                                 ),
                         ),
                 )
-                .when(selected, |this| {
+                .when(selected && !disabled, |this| {
                     this.child({
                         let (anchor, left) = self.submenu_anchor;
                         let is_bottom_pos =
@@ -1475,6 +1482,40 @@ impl Render for PopupMenu {
 mod tests {
     use super::*;
 
+
+    #[gpui::test]
+    fn owned_submenus_preserve_disabled_state(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
+        cx.update(|window, cx| {
+            let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+                menu.with_menu_items(
+                    [
+                        OwnedMenuItem::Submenu(gpui::OwnedMenu { name: "Disabled".into(), items: vec![], disabled: true }),
+                        OwnedMenuItem::Submenu(gpui::OwnedMenu { name: "Enabled".into(), items: vec![], disabled: false }),
+                    ],
+                    window,
+                    cx,
+                )
+            });
+            menu.update(cx, |menu, cx| {
+            for (index, expected) in [true, false].into_iter().enumerate() {
+                let item = &menu.menu_items[index];
+                let PopupMenuItem::Submenu { disabled, menu: child, .. } = item else {
+                    panic!("expected stock submenu");
+                };
+                assert_eq!(*disabled, expected);
+                assert_eq!(item.is_clickable(), !expected);
+                assert!(child.read(cx).parent_menu.is_some());
+                assert_eq!(child.read(cx).priority, menu.priority + 1);
+                menu.selected_index = Some(index);
+                assert_eq!(menu.active_submenu().is_some(), !expected);
+            }
+            });
+            menu.update(cx, |menu, _| {
+                menu.selected_index = None;
+            });
+        });
+    }
     #[gpui::test]
     fn popup_menu_item_a11y_label_uses_visible_label(cx: &mut gpui::TestAppContext) {
         let submenu = cx.update(|cx| cx.new(|cx| PopupMenu::new(cx)));

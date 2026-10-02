@@ -21,10 +21,94 @@ use crate::{
 };
 
 use super::{
-    InputBaseState, TextDecoration,
+    InputBaseState, ResolvedTextareaRotation, TextDecoration,
     layout::{LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
+    rotation::{
+        coalesce_underline_spans, snap_stroke_width, snap_to_device_pixel, strikethrough_band_top,
+        underline_origin_top, wavy_underline_metrics,
+    },
+    state::{
+        AccessibilityTextLayout, AccessibilityTextPosition, AccessibilityTextRun,
+        MAX_ACCESSIBILITY_RUN_CHARACTERS,
+    },
 };
+
+struct AccessibilityRunMap {
+    byte_range: Range<usize>,
+    character_starts: Vec<usize>,
+    visual_row: usize,
+}
+
+fn accessibility_position_for_byte(
+    runs: &[AccessibilityRunMap],
+    byte_offset: usize,
+    line_end_affinity: bool,
+) -> AccessibilityTextPosition {
+    let fallback = AccessibilityTextPosition {
+        run: runs.len().saturating_sub(1),
+        character_index: runs.last().map_or(0, |run| run.character_starts.len()),
+    };
+    for (index, run) in runs.iter().enumerate() {
+        if byte_offset < run.byte_range.end {
+            let character_index = run
+                .character_starts
+                .partition_point(|start| *start < byte_offset);
+            return AccessibilityTextPosition {
+                run: index,
+                character_index,
+            };
+        }
+        if byte_offset == run.byte_range.end {
+            let next_is_same_row = runs
+                .get(index + 1)
+                .is_some_and(|next| next.visual_row == run.visual_row);
+            if next_is_same_row || line_end_affinity || index + 1 == runs.len() {
+                return AccessibilityTextPosition {
+                    run: index,
+                    character_index: run.character_starts.len(),
+                };
+            }
+        }
+    }
+    fallback
+}
+
+fn accessibility_transform(
+    rotation: ResolvedTextareaRotation,
+    scale_factor: f32,
+) -> gpui::accesskit::Affine {
+    let matrix = rotation.device_transformation(scale_factor);
+    gpui::accesskit::Affine::new([
+        matrix.rotation_scale[0][0] as f64,
+        matrix.rotation_scale[1][0] as f64,
+        matrix.rotation_scale[0][1] as f64,
+        matrix.rotation_scale[1][1] as f64,
+        matrix.translation[0] as f64,
+        matrix.translation[1] as f64,
+    ])
+}
+
+fn accessibility_word_starts(value: &str, was_word: &mut bool) -> Vec<u8> {
+    value
+        .chars()
+        .enumerate()
+        .filter_map(|(index, character)| {
+            let is_word = character.is_alphanumeric() || character == '_';
+            let starts_word = is_word && !*was_word && index < u8::MAX as usize;
+            *was_word = is_word;
+            starts_word.then_some(index as u8)
+        })
+        .collect()
+}
+
+fn accessibility_row_top(
+    scrolled_content_top: Pixels,
+    visual_row: usize,
+    line_height: Pixels,
+) -> Pixels {
+    scrolled_content_top + visual_row as f32 * line_height
+}
 
 fn diagnostic_highlight_style(
     severity: crate::input::DiagnosticSeverity,
@@ -406,6 +490,217 @@ impl<M: InputModeKind> TextElement<M> {
         self
     }
 
+    fn layout_rotation_accessibility(
+        state: &InputBaseState<M>,
+        last_layout: &LastLayout,
+        bounds: Bounds<Pixels>,
+        text_size: Pixels,
+        style: &TextStyle,
+        window: &mut Window,
+    ) -> Option<AccessibilityTextLayout> {
+        if !state.accessibility_text_runs_enabled || state.masked {
+            return None;
+        }
+        let rotation = last_layout.textarea_rotation?;
+        let scale = window.scale_factor();
+        let transform = Some(accessibility_transform(rotation, scale));
+        let line_height = last_layout.line_height;
+        let mut runs = Vec::new();
+        let mut run_maps = Vec::new();
+        let line_count = state.display_map.buffer_line_count().max(1);
+
+        for buffer_line in 0..line_count {
+            let line_start = state.text.line_start_offset(buffer_line);
+            let next_line_start = (buffer_line + 1 < line_count)
+                .then(|| state.text.line_start_offset(buffer_line + 1));
+            let mut line_text: String = state.text.slice_line(buffer_line).into();
+            let hard_break = next_line_start.map(|next| {
+                if line_text.ends_with('\r') {
+                    line_text.pop();
+                    ("\r\n", next)
+                } else {
+                    ("\n", next)
+                }
+            });
+            let line_item = state.display_map.line(buffer_line)?;
+            let ranges = if line_item.wrapped_lines.is_empty() {
+                vec![0..0]
+            } else {
+                line_item
+                    .wrapped_lines
+                    .iter()
+                    .map(|range| range.start.min(line_text.len())..range.end.min(line_text.len()))
+                    .collect()
+            };
+            let mut shaped_rows = Vec::with_capacity(ranges.len());
+            for range in &ranges {
+                let value: SharedString = line_text[range.clone()].to_string().into();
+                shaped_rows.push(window.text_system().shape_line(
+                    value.clone(),
+                    text_size,
+                    &[TextRun {
+                        len: value.len(),
+                        font: style.font(),
+                        color: style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                ));
+            }
+            let wrap_indent = if line_item.indent > 0 && shaped_rows.len() > 1 {
+                let indent_byte_len = line_text
+                    .char_indices()
+                    .nth(line_item.indent as usize)
+                    .map(|(index, _)| index)
+                    .unwrap_or(line_text.len());
+                shaped_rows[0].x_for_index(indent_byte_len.min(ranges[0].end))
+            } else {
+                px(0.)
+            };
+            let longest_width = shaped_rows
+                .iter()
+                .map(|line| line.width)
+                .fold(px(0.), Pixels::max);
+            let alignment = last_layout.alignment_offset(longest_width);
+            let first_display_row = state.display_map.buffer_line_to_display_row(buffer_line);
+
+            for (row_index, (range, shaped)) in ranges.iter().zip(shaped_rows.iter()).enumerate() {
+                let visual_row = first_display_row + row_index;
+                let indent = if row_index == 0 { px(0.) } else { wrap_indent };
+                let row_left = bounds.origin.x + last_layout.line_number_width + alignment + indent;
+                let row_top = accessibility_row_top(bounds.origin.y, visual_row, line_height);
+                let row_text = &line_text[range.clone()];
+                let mut characters: Vec<(usize, usize, Pixels, Pixels)> = row_text
+                    .char_indices()
+                    .map(|(local_start, character)| {
+                        let local_end = local_start + character.len_utf8();
+                        (
+                            line_start + range.start + local_start,
+                            line_start + range.start + local_end,
+                            shaped.x_for_index(local_start),
+                            shaped.x_for_index(local_end),
+                        )
+                    })
+                    .collect();
+                let is_final_row = row_index + 1 == ranges.len();
+                if is_final_row && let Some((_, next_start)) = hard_break {
+                    characters.push((
+                        line_start + line_text.len(),
+                        next_start,
+                        shaped.width,
+                        shaped.width,
+                    ));
+                }
+
+                if characters.is_empty() {
+                    let index = runs.len();
+                    runs.push(AccessibilityTextRun {
+                        value: String::new(),
+                        character_lengths: vec![],
+                        character_positions: vec![],
+                        character_widths: vec![],
+                        word_starts: vec![],
+                        bounds: gpui::accesskit::Rect::new(
+                            f32::from(row_left) as f64 * scale as f64,
+                            f32::from(row_top) as f64 * scale as f64,
+                            f32::from(row_left) as f64 * scale as f64,
+                            f32::from(row_top + line_height) as f64 * scale as f64,
+                        ),
+                        transform,
+                        previous_on_line: None,
+                        next_on_line: None,
+                    });
+                    run_maps.push(AccessibilityRunMap {
+                        byte_range: line_start..line_start,
+                        character_starts: vec![],
+                        visual_row,
+                    });
+                    debug_assert_eq!(index, run_maps.len() - 1);
+                    continue;
+                }
+
+                let mut was_word = false;
+                for chunk in characters.chunks(MAX_ACCESSIBILITY_RUN_CHARACTERS) {
+                    let first = chunk.first().unwrap();
+                    let last = chunk.last().unwrap();
+                    let chunk_base_x = first.2;
+                    let mut value = state.text.slice(first.0..last.1).to_string();
+                    if last.1 > line_start + line_text.len() {
+                        value = format!(
+                            "{}{}",
+                            &line_text[first.0 - line_start..],
+                            hard_break.unwrap().0
+                        );
+                    }
+                    let character_lengths = chunk
+                        .iter()
+                        .map(|(start, end, _, _)| (end - start) as u8)
+                        .collect();
+                    let character_positions = chunk
+                        .iter()
+                        .map(|(_, _, start, _)| f32::from(*start - chunk_base_x) * scale)
+                        .collect();
+                    let character_widths = chunk
+                        .iter()
+                        .map(|(_, _, start, end)| f32::from(*end - *start) * scale)
+                        .collect();
+                    let word_starts = accessibility_word_starts(&value, &mut was_word);
+                    let run_index = runs.len();
+                    let previous = if run_index > 0
+                        && run_maps
+                            .last()
+                            .is_some_and(|run| run.visual_row == visual_row)
+                    {
+                        Some(run_index - 1)
+                    } else {
+                        None
+                    };
+                    if let Some(previous) = previous {
+                        runs[previous].next_on_line = Some(run_index);
+                    }
+                    runs.push(AccessibilityTextRun {
+                        value,
+                        character_lengths,
+                        character_positions,
+                        character_widths,
+                        word_starts,
+                        bounds: gpui::accesskit::Rect::new(
+                            f32::from(row_left + chunk_base_x) as f64 * scale as f64,
+                            f32::from(row_top) as f64 * scale as f64,
+                            f32::from(row_left + last.3) as f64 * scale as f64,
+                            f32::from(row_top + line_height) as f64 * scale as f64,
+                        ),
+                        transform,
+                        previous_on_line: previous,
+                        next_on_line: None,
+                    });
+                    run_maps.push(AccessibilityRunMap {
+                        byte_range: first.0..last.1,
+                        character_starts: chunk.iter().map(|character| character.0).collect(),
+                        visual_row,
+                    });
+                }
+            }
+        }
+
+        let (anchor_offset, focus_offset) = if state.selection_reversed {
+            (state.selected_range.end, state.selected_range.start)
+        } else {
+            (state.selected_range.start, state.selected_range.end)
+        };
+        Some(AccessibilityTextLayout {
+            anchor: accessibility_position_for_byte(&run_maps, anchor_offset, false),
+            focus: accessibility_position_for_byte(
+                &run_maps,
+                focus_offset,
+                state.cursor_line_end_affinity,
+            ),
+            runs,
+        })
+    }
+
     fn paint_mouse_listeners(&mut self, window: &mut Window, _: &mut App) {
         window.on_mouse_event({
             let state = self.state.clone();
@@ -623,6 +918,25 @@ impl<M: InputModeKind> TextElement<M> {
         range: Range<usize>,
         last_layout: &LastLayout,
         bounds: &Bounds<Pixels>,
+        rotation: Option<ResolvedTextareaRotation>,
+    ) -> Option<Path<Pixels>> {
+        Self::layout_range_band(
+            range,
+            last_layout,
+            bounds,
+            rotation,
+            px(0.),
+            last_layout.line_height,
+        )
+    }
+
+    fn layout_range_band(
+        range: Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        rotation: Option<ResolvedTextareaRotation>,
+        band_top: Pixels,
+        band_height: Pixels,
     ) -> Option<Path<Pixels>> {
         if range.is_empty() {
             return None;
@@ -691,10 +1005,10 @@ impl<M: InputModeKind> TextElement<M> {
                 end_x = end_x.max(start.x + px(6.));
 
                 line_corners.push(Corners {
-                    top_left: line_origin + point(start.x, start.y),
-                    top_right: line_origin + point(end_x, start.y),
-                    bottom_left: line_origin + point(start.x, start.y + line_height),
-                    bottom_right: line_origin + point(end_x, start.y + line_height),
+                    top_left: line_origin + point(start.x, start.y + band_top),
+                    top_right: line_origin + point(end_x, start.y + band_top),
+                    bottom_left: line_origin + point(start.x, start.y + band_top + band_height),
+                    bottom_right: line_origin + point(end_x, start.y + band_top + band_height),
                 });
 
                 // wrapped lines
@@ -705,12 +1019,11 @@ impl<M: InputModeKind> TextElement<M> {
                     if i < wrapped_lines {
                         end.x = line_size.width;
                     }
-
                     line_corners.push(Corners {
-                        top_left: line_origin + point(start.x, start.y),
-                        top_right: line_origin + point(end.x, start.y),
-                        bottom_left: line_origin + point(start.x, start.y + line_height),
-                        bottom_right: line_origin + point(end.x, start.y + line_height),
+                        top_left: line_origin + point(start.x, start.y + band_top),
+                        top_right: line_origin + point(end.x, start.y + band_top),
+                        bottom_left: line_origin + point(start.x, start.y + band_top + band_height),
+                        bottom_right: line_origin + point(end.x, start.y + band_top + band_height),
                     });
                 }
             }
@@ -756,12 +1069,230 @@ impl<M: InputModeKind> TextElement<M> {
         let path_origin = bounds.origin + point(line_number_width, px(0.));
         let first_p = *points.get(0).unwrap();
         let mut builder = gpui::PathBuilder::fill();
-        builder.move_to(path_origin + first_p);
+        let to_world = |position| {
+            let position = path_origin + position;
+            rotation
+                .map(|rotation| rotation.to_world(position))
+                .unwrap_or(position)
+        };
+        builder.move_to(to_world(first_p));
         for p in points.iter().skip(1) {
-            builder.line_to(path_origin + *p);
+            builder.line_to(to_world(*p));
         }
 
         builder.build().ok()
+    }
+
+    fn layout_strikethrough_range(
+        range: Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        rotation: Option<ResolvedTextareaRotation>,
+        thickness: Pixels,
+    ) -> Option<Path<Pixels>> {
+        if range.is_empty()
+            || range.start < last_layout.visible_range_offset.start
+            || range.end > last_layout.visible_range_offset.end
+        {
+            return None;
+        }
+
+        let line_height = last_layout.line_height;
+        let mut line_top = last_layout.visible_top;
+        let path_origin = bounds.origin + point(last_layout.line_number_width, px(0.));
+        let to_world = |position| {
+            let position = path_origin + position;
+            rotation
+                .map(|rotation| rotation.to_world(position))
+                .unwrap_or(position)
+        };
+        let mut builder = gpui::PathBuilder::fill();
+        let mut has_path = false;
+
+        for (line_offset, line) in last_layout
+            .visible_line_byte_offsets
+            .iter()
+            .copied()
+            .zip(last_layout.lines.iter())
+        {
+            let alignment = last_layout.alignment_offset(line.longest_width);
+            let mut wrapped_offset = line_offset;
+            for (visual_line, shaped_line) in line.wrapped_lines.iter().enumerate() {
+                let wrapped_end = wrapped_offset + shaped_line.len();
+                let start = range.start.max(wrapped_offset);
+                let end = range.end.min(wrapped_end);
+                if start < end {
+                    let indent = if visual_line == 0 {
+                        px(0.)
+                    } else {
+                        line.wrap_indent
+                    };
+                    let left = alignment
+                        + indent
+                        + shaped_line.x_for_index(start.saturating_sub(wrapped_offset));
+                    let right = alignment
+                        + indent
+                        + shaped_line.x_for_index(end.saturating_sub(wrapped_offset));
+                    let top = line_top
+                        + visual_line as f32 * line_height
+                        + strikethrough_band_top(
+                            line_height,
+                            shaped_line.ascent,
+                            shaped_line.descent,
+                        );
+                    let corners = [
+                        point(left, top),
+                        point(right, top),
+                        point(right, top + thickness),
+                        point(left, top + thickness),
+                    ];
+                    builder.move_to(to_world(corners[0]));
+                    for corner in corners.iter().skip(1) {
+                        builder.line_to(to_world(*corner));
+                    }
+                    builder.close();
+                    has_path = true;
+                }
+                wrapped_offset = wrapped_end;
+            }
+            line_top += line.size(line_height).height;
+        }
+
+        has_path.then(|| builder.build().ok()).flatten()
+    }
+
+    fn layout_underline_range(
+        range: Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        rotation: Option<ResolvedTextareaRotation>,
+        style: UnderlineStyle,
+        scale_factor: f32,
+    ) -> Option<Path<Pixels>> {
+        if range.is_empty()
+            || range.start < last_layout.visible_range_offset.start
+            || range.end > last_layout.visible_range_offset.end
+        {
+            return None;
+        }
+
+        let snapped_thickness = snap_stroke_width(style.thickness, scale_factor);
+        if snapped_thickness <= px(0.) {
+            return None;
+        }
+
+        let line_height = last_layout.line_height;
+        let mut line_top = last_layout.visible_top;
+        let path_origin = bounds.origin + point(last_layout.line_number_width, px(0.));
+        let to_world = |position| {
+            rotation
+                .map(|rotation| rotation.to_world(position))
+                .unwrap_or(position)
+        };
+        let mut builder = if style.wavy {
+            gpui::PathBuilder::stroke(snapped_thickness)
+        } else {
+            gpui::PathBuilder::fill()
+        };
+        let wavy_metrics = style
+            .wavy
+            .then(|| wavy_underline_metrics(style.thickness, scale_factor));
+        let mut has_path = false;
+
+        for (line_offset, line) in last_layout
+            .visible_line_byte_offsets
+            .iter()
+            .copied()
+            .zip(last_layout.lines.iter())
+        {
+            let alignment = last_layout.alignment_offset(line.longest_width);
+            let mut wrapped_offset = line_offset;
+            for (visual_line, shaped_line) in line.wrapped_lines.iter().enumerate() {
+                let wrapped_end = wrapped_offset + shaped_line.len();
+                let start = range.start.max(wrapped_offset);
+                let end = range.end.min(wrapped_end);
+                if start < end {
+                    let indent = if visual_line == 0 {
+                        px(0.)
+                    } else {
+                        line.wrap_indent
+                    };
+                    let left = alignment
+                        + indent
+                        + shaped_line.x_for_index(start.saturating_sub(wrapped_offset));
+                    let right = alignment
+                        + indent
+                        + shaped_line.x_for_index(end.saturating_sub(wrapped_offset));
+                    let origin = point(
+                        snap_to_device_pixel(path_origin.x + left, scale_factor),
+                        snap_to_device_pixel(
+                            path_origin.y
+                                + line_top
+                                + visual_line as f32 * line_height
+                                + underline_origin_top(
+                                    line_height,
+                                    shaped_line.ascent,
+                                    shaped_line.descent,
+                                ),
+                            scale_factor,
+                        ),
+                    );
+                    let width = snap_stroke_width(right - left, scale_factor);
+                    if width > px(0.) {
+                        if let Some(metrics) = wavy_metrics {
+                            let centre_y = origin.y + metrics.height / 2.;
+                            let mut offset = px(0.);
+                            builder.move_to(to_world(point(origin.x, centre_y)));
+                            let quarter_wave = metrics.wavelength / 4.;
+                            while offset < width {
+                                let next_offset = (offset + quarter_wave).min(width);
+                                let phase = std::f32::consts::TAU * offset.as_f32()
+                                    / metrics.wavelength.as_f32();
+                                let next_phase = std::f32::consts::TAU * next_offset.as_f32()
+                                    / metrics.wavelength.as_f32();
+                                let start_y = centre_y + metrics.amplitude * phase.sin();
+                                let end_y = centre_y + metrics.amplitude * next_phase.sin();
+                                let derivative_scale = std::f32::consts::TAU
+                                    * metrics.amplitude.as_f32()
+                                    / metrics.wavelength.as_f32();
+                                let run = next_offset - offset;
+                                let control_a = point(
+                                    origin.x + offset + run / 3.,
+                                    start_y + run * (derivative_scale * phase.cos() / 3.),
+                                );
+                                let control_b = point(
+                                    origin.x + next_offset - run / 3.,
+                                    end_y - run * (derivative_scale * next_phase.cos() / 3.),
+                                );
+                                builder.cubic_bezier_to(
+                                    to_world(point(origin.x + next_offset, end_y)),
+                                    to_world(control_a),
+                                    to_world(control_b),
+                                );
+                                offset = next_offset;
+                            }
+                        } else {
+                            let corners = [
+                                origin,
+                                point(origin.x + width, origin.y),
+                                point(origin.x + width, origin.y + snapped_thickness),
+                                point(origin.x, origin.y + snapped_thickness),
+                            ];
+                            builder.move_to(to_world(corners[0]));
+                            for corner in corners.iter().skip(1) {
+                                builder.line_to(to_world(*corner));
+                            }
+                            builder.close();
+                        }
+                        has_path = true;
+                    }
+                }
+                wrapped_offset = wrapped_end;
+            }
+            line_top += line.size(line_height).height;
+        }
+
+        has_path.then(|| builder.build().ok()).flatten()
     }
 
     fn layout_search_matches(
@@ -779,7 +1310,12 @@ impl<M: InputModeKind> TextElement<M> {
 
         let mut paths = Vec::with_capacity(ranges.as_ref().len());
         for (index, range) in ranges.as_ref().iter().enumerate() {
-            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
+            if let Some(path) = Self::layout_match_range(
+                range.clone(),
+                last_layout,
+                bounds,
+                last_layout.textarea_rotation,
+            ) {
                 paths.push((path, current_match_ix == index));
             }
         }
@@ -798,7 +1334,12 @@ impl<M: InputModeKind> TextElement<M> {
             return None;
         };
 
-        Self::layout_match_range(symbol_range, last_layout, bounds)
+        Self::layout_match_range(
+            symbol_range,
+            last_layout,
+            bounds,
+            last_layout.textarea_rotation,
+        )
     }
 
     fn layout_document_colors(
@@ -810,7 +1351,12 @@ impl<M: InputModeKind> TextElement<M> {
     ) -> Vec<(Path<Pixels>, Hsla)> {
         let mut paths = vec![];
         for (range, color) in document_colors.iter() {
-            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
+            if let Some(path) = Self::layout_match_range(
+                range.clone(),
+                last_layout,
+                bounds,
+                last_layout.textarea_rotation,
+            ) {
                 paths.push((path, *color));
             }
         }
@@ -854,7 +1400,7 @@ impl<M: InputModeKind> TextElement<M> {
         let range = start_ix.max(last_layout.visible_range_offset.start)
             ..end_ix.min(last_layout.visible_range_offset.end);
 
-        Self::layout_match_range(range, &last_layout, bounds)
+        Self::layout_match_range(range, &last_layout, bounds, last_layout.textarea_rotation)
     }
 
     /// Calculate the visible range of lines in the viewport.
@@ -1570,9 +2116,13 @@ pub(super) struct PrepaintState {
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
+    rotated_background_paths: Vec<(Path<Pixels>, Hsla)>,
+    rotated_underline_paths: Vec<(Path<Pixels>, Hsla)>,
+    rotated_strikethrough_paths: Vec<(Path<Pixels>, Hsla)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
     bounds: Bounds<Pixels>,
+    input_bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
     // Inline completion rendering data
@@ -1720,7 +2270,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let (line_number_width, line_number_len) =
             Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
 
-        let mut bounds = bounds;
+        let textarea_rotation = state
+            .textarea_rotation
+            .map(|rotation| rotation.resolve(bounds));
+        let mut bounds = textarea_rotation
+            .map(|rotation| rotation.content_bounds())
+            .unwrap_or(bounds);
         let wrap_width = if multi_line && state.soft_wrap {
             Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
         } else {
@@ -1802,6 +2357,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cursor_bounds: None,
             text_align: state.text_align,
             content_width: bounds.size.width,
+            textarea_rotation,
         };
 
         let run = TextRun {
@@ -1831,7 +2387,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.masked,
         );
 
-        let runs = if let (false, Some(highlight_styles)) = (is_empty, highlight_styles) {
+        let mut runs = if let (false, Some(highlight_styles)) = (is_empty, highlight_styles) {
             let mut runs = Vec::with_capacity(highlight_styles.len() + 2);
 
             for (range, style) in &highlight_styles {
@@ -1857,6 +2413,36 @@ impl<M: InputModeKind> Element for TextElement<M> {
             )
             .into_vec()
         };
+
+        // GPUI's transformed glyph painter deliberately rejects decorated runs. Preserve the
+        // same styling for rotated text by shaping glyph-only runs and painting decoration bands
+        // through the resolved textarea transform below.
+        let rotated_run_decorations = textarea_rotation.map(|_| {
+            let mut offset = last_layout.visible_range_offset.start;
+            runs.iter()
+                .filter_map(|run| {
+                    let range = offset..offset + run.len;
+                    offset += run.len;
+                    (run.background_color.is_some()
+                        || run.underline.is_some()
+                        || run.strikethrough.is_some())
+                    .then_some((
+                        range,
+                        run.background_color,
+                        run.underline,
+                        run.strikethrough,
+                        run.color,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        if textarea_rotation.is_some() {
+            for run in &mut runs {
+                run.background_color = None;
+                run.underline = None;
+                run.strikethrough = None;
+            }
+        }
 
         let document_colors = state
             .extras
@@ -1980,12 +2566,75 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let (cursor_bounds, cursor_scroll_offset, current_row) =
             self.layout_cursor(&last_layout, &mut bounds, scroll_size, window, cx);
         last_layout.cursor_bounds = cursor_bounds;
+        {
+            let state = self.state.read(cx);
+            if state.accessibility_text_runs_enabled {
+                *state.accessibility_text_layout.borrow_mut() = Self::layout_rotation_accessibility(
+                    state,
+                    &last_layout,
+                    bounds,
+                    text_size,
+                    &text_style,
+                    window,
+                );
+            }
+        }
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
+        let mut rotated_background_paths = Vec::new();
+        let mut rotated_underline_paths = Vec::new();
+        let mut rotated_strikethrough_paths = Vec::new();
+        let rotated_run_decorations = rotated_run_decorations.unwrap_or_default();
+        let underlines = coalesce_underline_spans(rotated_run_decorations.iter().filter_map(
+            |(range, _, underline, _, foreground)| {
+                underline.map(|underline| (range.clone(), underline, *foreground))
+            },
+        ));
+        for (range, background, _, strikethrough, foreground) in &rotated_run_decorations {
+            if let Some(color) = background {
+                if let Some(path) = Self::layout_match_range(
+                    range.clone(),
+                    &last_layout,
+                    &bounds,
+                    textarea_rotation,
+                ) {
+                    rotated_background_paths.push((path, *color));
+                }
+            }
+            if let Some(strikethrough) = strikethrough {
+                if let Some(path) = Self::layout_strikethrough_range(
+                    range.clone(),
+                    &last_layout,
+                    &bounds,
+                    textarea_rotation,
+                    strikethrough.thickness.max(px(1.)),
+                ) {
+                    rotated_strikethrough_paths
+                        .push((path, strikethrough.color.unwrap_or(*foreground)));
+                }
+            }
+        }
+        for (range, underline) in underlines {
+            if let Some(path) = Self::layout_underline_range(
+                range,
+                &last_layout,
+                &bounds,
+                textarea_rotation,
+                underline,
+                window.scale_factor(),
+            ) {
+                rotated_underline_paths.push((
+                    path,
+                    underline
+                        .color
+                        .expect("coalesced underlines always have an effective colour"),
+                ));
+            }
+        }
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
@@ -2055,6 +2704,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         PrepaintState {
             bounds,
+            input_bounds,
             last_layout,
             scroll_size,
             line_numbers,
@@ -2066,6 +2716,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             hover_highlight_path,
             hover_definition_hitbox,
             document_color_paths,
+            rotated_background_paths,
+            rotated_underline_paths,
+            rotated_strikethrough_paths,
             indent_guides_path,
             fold_icon_layout,
             ghost_first_line,
@@ -2078,7 +2731,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
-        input_bounds: Bounds<Pixels>,
+        frame_bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
@@ -2098,6 +2751,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let focused = focus_handle.is_focused(window);
         let bounds = prepaint.bounds;
         let text_align = prepaint.last_layout.text_align;
+        let textarea_rotation = prepaint.last_layout.textarea_rotation;
 
         window.handle_input(
             &focus_handle,
@@ -2130,7 +2784,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
                 let is_active = prepaint.current_row == Some(buffer_line);
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
+                let p = point(frame_bounds.origin.x, origin.y + offset_y);
                 let height = line_height * lines.len() as f32;
                 // Paint the current line background
                 if is_active {
@@ -2180,6 +2834,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_path(path.clone(), color);
         }
 
+        for (path, color) in prepaint.rotated_background_paths.iter() {
+            window.paint_path(path.clone(), *color);
+        }
+
         // Paint text with inline completion ghost line support
         let mut offset_y = invisible_top_padding;
         let ghost_lines = &prepaint.ghost_lines;
@@ -2213,14 +2871,26 @@ impl<M: InputModeKind> Element for TextElement<M> {
             );
 
             // Paint the actual line
-            _ = line.paint(
-                p,
-                line_height,
-                text_align,
-                Some(prepaint.last_layout.content_width),
-                window,
-                cx,
-            );
+            if let Some(rotation) = textarea_rotation {
+                line.paint_transformed(
+                    p,
+                    line_height,
+                    text_align,
+                    Some(prepaint.last_layout.content_width),
+                    rotation.device_transformation(window.scale_factor()),
+                    window,
+                    cx,
+                );
+            } else {
+                line.paint(
+                    p,
+                    line_height,
+                    text_align,
+                    Some(prepaint.last_layout.content_width),
+                    window,
+                    cx,
+                );
+            }
             offset_y += line.size(line_height).height;
 
             if Some(row) == prepaint.current_row {
@@ -2258,10 +2928,34 @@ impl<M: InputModeKind> Element for TextElement<M> {
             }
         }
 
+        for (path, color) in prepaint.rotated_underline_paths.iter() {
+            window.paint_path(path.clone(), *color);
+        }
+        for (path, color) in prepaint.rotated_strikethrough_paths.iter() {
+            window.paint_path(path.clone(), *color);
+        }
+
         // Paint blinking cursor
         if focused && show_cursor {
             if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
-                window.paint_quad(fill(cursor_bounds, editor_style.caret));
+                if let Some(rotation) = textarea_rotation {
+                    let corners = [
+                        cursor_bounds.origin,
+                        point(cursor_bounds.right(), cursor_bounds.top()),
+                        point(cursor_bounds.right(), cursor_bounds.bottom()),
+                        point(cursor_bounds.left(), cursor_bounds.bottom()),
+                    ];
+                    let mut builder = gpui::PathBuilder::fill();
+                    builder.move_to(rotation.to_world(corners[0]));
+                    for corner in corners.iter().skip(1) {
+                        builder.line_to(rotation.to_world(*corner));
+                    }
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, editor_style.caret);
+                    }
+                } else {
+                    window.paint_quad(fill(cursor_bounds, editor_style.caret));
+                }
             }
         }
 
@@ -2278,7 +2972,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .editor_gutter_background
                 .unwrap_or(editor_background);
             let gutter_bounds = editor_gutter_bounds(
-                input_bounds,
+                frame_bounds,
                 prepaint.last_layout.line_number_width,
                 prepaint.ghost_lines_height,
                 editor_paddings,
@@ -2290,7 +2984,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
+                let p = point(frame_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
                 let height = line_height * lines.len() as f32;
@@ -2331,7 +3025,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
-            state.set_input_bounds(input_bounds, cx);
+            state.set_input_bounds(prepaint.input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
@@ -3191,5 +3885,65 @@ mod tests {
             cursor_surrounding_padding(false, None, visible_lines, line_height),
             raw.min(half),
         );
+    }
+
+    #[test]
+    fn accessibility_positions_preserve_chunk_and_soft_wrap_boundaries() {
+        let runs = vec![
+            AccessibilityRunMap {
+                byte_range: 0..2,
+                character_starts: vec![0, 1],
+                visual_row: 0,
+            },
+            AccessibilityRunMap {
+                byte_range: 2..4,
+                character_starts: vec![2, 3],
+                visual_row: 0,
+            },
+            AccessibilityRunMap {
+                byte_range: 4..7,
+                character_starts: vec![4, 6],
+                visual_row: 1,
+            },
+        ];
+
+        let chunk_boundary = accessibility_position_for_byte(&runs, 2, false);
+        assert_eq!((chunk_boundary.run, chunk_boundary.character_index), (0, 2));
+        let next_wrapped_row = accessibility_position_for_byte(&runs, 4, false);
+        assert_eq!(
+            (next_wrapped_row.run, next_wrapped_row.character_index),
+            (2, 0)
+        );
+        let previous_wrapped_row = accessibility_position_for_byte(&runs, 4, true);
+        assert_eq!(
+            (
+                previous_wrapped_row.run,
+                previous_wrapped_row.character_index
+            ),
+            (1, 2)
+        );
+        let inside_multibyte = accessibility_position_for_byte(&runs, 5, false);
+        assert_eq!(
+            (inside_multibyte.run, inside_multibyte.character_index),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn accessibility_word_starts_are_transitions_not_every_word_character() {
+        let mut was_word = false;
+        assert_eq!(
+            accessibility_word_starts("one two_three 4", &mut was_word),
+            vec![0, 4, 14]
+        );
+        assert!(was_word);
+        assert_eq!(accessibility_word_starts("more", &mut was_word), vec![]);
+        assert_eq!(accessibility_word_starts(" next", &mut was_word), vec![1]);
+    }
+
+    #[test]
+    fn accessibility_rows_share_the_scrolled_paint_origin() {
+        assert_eq!(accessibility_row_top(px(-13.), 0, px(20.)), px(-13.));
+        assert_eq!(accessibility_row_top(px(-13.), 3, px(20.)), px(47.));
     }
 }

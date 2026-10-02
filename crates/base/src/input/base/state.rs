@@ -13,7 +13,7 @@ use gpui::{
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use sum_tree::Bias;
@@ -37,6 +37,69 @@ use crate::input::{
     InputExtras as _, Position, RopeExt as _, Selection, element::RIGHT_MARGIN, layout::LastLayout,
 };
 use crate::{AutoScroll, StepAction};
+
+pub(crate) const MAX_ACCESSIBILITY_RUN_CHARACTERS: usize = 255;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AccessibilityTextPosition {
+    pub(crate) run: usize,
+    pub(crate) character_index: usize,
+}
+
+pub(crate) struct AccessibilityTextRun {
+    pub(crate) value: String,
+    pub(crate) character_lengths: Vec<u8>,
+    pub(crate) character_positions: Vec<f32>,
+    pub(crate) character_widths: Vec<f32>,
+    pub(crate) word_starts: Vec<u8>,
+    pub(crate) bounds: gpui::accesskit::Rect,
+    pub(crate) transform: Option<gpui::accesskit::Affine>,
+    pub(crate) previous_on_line: Option<usize>,
+    pub(crate) next_on_line: Option<usize>,
+}
+
+pub(crate) struct AccessibilityTextLayout {
+    pub(crate) runs: Vec<AccessibilityTextRun>,
+    pub(crate) anchor: AccessibilityTextPosition,
+    pub(crate) focus: AccessibilityTextPosition,
+}
+
+impl AccessibilityTextLayout {
+    fn push(self, builder: &mut gpui::A11ySubtreeBuilder) {
+        for (index, run) in self.runs.into_iter().enumerate() {
+            let mut node = gpui::accesskit::Node::new(gpui::Role::TextRun);
+            node.set_text_direction(gpui::accesskit::TextDirection::LeftToRight);
+            node.set_value(run.value);
+            node.set_character_lengths(run.character_lengths);
+            node.set_character_positions(run.character_positions);
+            node.set_character_widths(run.character_widths);
+            node.set_word_starts(run.word_starts);
+            node.set_bounds(run.bounds);
+            if let Some(transform) = run.transform {
+                node.set_transform(transform);
+            }
+            if let Some(previous) = run.previous_on_line {
+                node.set_previous_on_line(builder.synthetic_node_id(previous as u64));
+            }
+            if let Some(next) = run.next_on_line {
+                node.set_next_on_line(builder.synthetic_node_id(next as u64));
+            }
+            builder.push_child(builder.synthetic_node_id(index as u64), node);
+        }
+
+        let anchor = gpui::accesskit::TextPosition {
+            node: builder.synthetic_node_id(self.anchor.run as u64),
+            character_index: self.anchor.character_index,
+        };
+        let focus = gpui::accesskit::TextPosition {
+            node: builder.synthetic_node_id(self.focus.run as u64),
+            character_index: self.focus.character_index,
+        };
+        builder
+            .parent_node()
+            .set_text_selection(gpui::accesskit::TextSelection { anchor, focus });
+    }
+}
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
@@ -338,6 +401,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
+    pub(super) textarea_rotation: Option<super::TextareaRotation>,
+    pub(super) accessibility_text_runs_enabled: bool,
+    pub(super) accessibility_text_layout: Rc<RefCell<Option<AccessibilityTextLayout>>>,
     pub(super) editor_paddings: Edges<Pixels>,
     pub(super) editor_style: InputEditorStyle,
 
@@ -632,6 +698,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
             editor_scrollbar_snapshot: Cell::new(None),
+            textarea_rotation: None,
+            accessibility_text_runs_enabled: false,
+            accessibility_text_layout: Rc::new(RefCell::new(None)),
             editor_paddings: Edges::default(),
             deferred_scroll_offset: None,
             preferred_column: None,
@@ -734,6 +803,40 @@ impl<M: InputModeKind> InputBaseState<M> {
     #[doc(hidden)]
     pub fn set_editor_paddings(&mut self, paddings: Edges<Pixels>) {
         self.editor_paddings = paddings;
+    }
+
+    /// Set or clear the resolved-layout contract for a rotated ordinary Textarea.
+    #[doc(hidden)]
+    pub fn set_textarea_rotation(&mut self, rotation: Option<super::TextareaRotation>) {
+        self.textarea_rotation = rotation;
+    }
+
+    /// Return the current rotated-Textarea layout contract.
+    #[doc(hidden)]
+    pub fn textarea_rotation(&self) -> Option<super::TextareaRotation> {
+        self.textarea_rotation
+    }
+
+    /// Enable the post-layout AccessKit text subtree used by rotated Textarea.
+    #[doc(hidden)]
+    pub fn set_rotation_accessibility_enabled(&mut self, enabled: bool) {
+        self.accessibility_text_runs_enabled = enabled;
+        if !enabled {
+            self.accessibility_text_layout.borrow_mut().take();
+        }
+    }
+
+    /// Capture the shared layout cell in a callback that runs after child prepaint.
+    #[doc(hidden)]
+    pub fn rotation_accessibility_text_runs(
+        &self,
+    ) -> Box<dyn FnOnce(&mut gpui::A11ySubtreeBuilder) + 'static> {
+        let layout = self.accessibility_text_layout.clone();
+        Box::new(move |builder| {
+            if let Some(layout) = layout.borrow_mut().take() {
+                layout.push(builder);
+            }
+        })
     }
 
     pub fn apply_highlighter_fold_candidates(
@@ -1746,11 +1849,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Check if mouse is within bounds
+        // Check if mouse is within the untransformed text-layout bounds.
+        let position = self
+            .last_layout
+            .as_ref()
+            .and_then(|layout| layout.textarea_rotation)
+            .map(|rotation| rotation.to_local(event.position))
+            .unwrap_or(event.position);
         let within_bounds = self
             .last_bounds
             .as_ref()
-            .map(|bounds| bounds.contains(&event.position))
+            .map(|bounds| bounds.contains(&position))
             .unwrap_or(false);
 
         if !within_bounds {
@@ -2120,6 +2229,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             return 0;
         };
 
+        let position = last_layout
+            .textarea_rotation
+            .map(|rotation| rotation.to_local(position))
+            .unwrap_or(position);
         let line_height = last_layout.line_height;
         let line_number_width = last_layout.line_number_width;
 
@@ -2409,7 +2522,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.select_to(offset, cx);
 
         if !self.is_single_line() {
-            let delta = AutoScroll::compute_delta(event.position.y, self.input_bounds);
+            let local_position = self
+                .last_layout
+                .as_ref()
+                .and_then(|layout| layout.textarea_rotation)
+                .map(|rotation| rotation.to_local(event.position))
+                .unwrap_or(event.position);
+            let delta = AutoScroll::compute_delta(local_position.y, self.input_bounds);
             // Input's ScrollHandle uses negative-y-is-down; negate the positive-towards-bottom delta.
             let scroll_delta = delta.map(|d| -d);
             self.auto_scroll.set(scroll_delta, cx, |delta, state, cx| {
@@ -2562,10 +2681,16 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         };
 
-        Some(Bounds::from_corners(
+        let bounds = Bounds::from_corners(
             last_bounds.origin + start_pos,
             last_bounds.origin + end_pos + point(px(0.), last_layout.line_height),
-        ))
+        );
+        Some(
+            last_layout
+                .textarea_rotation
+                .map(|rotation| rotation.bounds_to_world_aabb(bounds))
+                .unwrap_or(bounds),
+        )
     }
 
     /// Replace text in range in silent.
@@ -2973,11 +3098,17 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // Ensure at same line.
         end_origin.y = start_origin.y;
 
-        Some(Bounds::from_corners(
+        let bounds = Bounds::from_corners(
             bounds.origin + line_number_origin + start_origin,
             // + line_height for show IME panel under the cursor line.
             bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + line_height),
-        ))
+        );
+        Some(
+            last_layout
+                .textarea_rotation
+                .map(|rotation| rotation.bounds_to_world_aabb(bounds))
+                .unwrap_or(bounds),
+        )
     }
 
     fn character_index_for_point(
@@ -2987,6 +3118,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let last_layout = self.last_layout.as_ref()?;
+        let point = last_layout
+            .textarea_rotation
+            .map(|rotation| rotation.to_local(point))
+            .unwrap_or(point);
         let line_point = self.last_bounds?.localize(&point)?;
 
         for (vi, line) in last_layout.lines.iter().enumerate() {

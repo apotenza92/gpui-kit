@@ -1,6 +1,7 @@
 use std::{rc::Rc, time::Duration};
 
 use crate::animation::{Lerp, ease_in_out_cubic};
+use crate::button::{ButtonVariant, ButtonVariantStyle};
 use crate::{ActiveTheme, Icon, IconName, Selectable, Sizable, Size, StyledExt, h_flex};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -379,6 +380,15 @@ struct TabStyle {
     inner_bg: Background,
 }
 
+impl TabStyle {
+    fn with_button_colors(mut self, colors: ButtonVariantStyle) -> Self {
+        self.bg = colors.bg;
+        self.fg = colors.fg;
+        self.border_color = colors.border;
+        self
+    }
+}
+
 impl Default for TabStyle {
     fn default() -> Self {
         TabStyle {
@@ -405,6 +415,7 @@ pub struct Tab {
     suffix: Option<AnyElement>,
     children: Vec<AnyElement>,
     variant: TabVariant,
+    button_states: bool,
     size: Size,
     pub(super) disabled: bool,
     pub(super) selected: bool,
@@ -466,6 +477,7 @@ impl Default for Tab {
             prefix: None,
             suffix: None,
             variant: TabVariant::default(),
+            button_states: false,
             size: Size::default(),
             max_width: None,
             on_click: None,
@@ -474,6 +486,13 @@ impl Default for Tab {
 }
 
 impl Tab {
+    /// Opt into Ghost Button state fills with Outline borders for Outline tabs only.
+    /// Off by default; preserves tab geometry, semantics and focus behaviour.
+    pub fn button_states(mut self, enabled: bool) -> Self {
+        self.button_states = enabled;
+        self
+    }
+
     /// Create a new tab with a label.
     pub fn new() -> Self {
         Self::default()
@@ -622,8 +641,20 @@ impl RenderOnce for Tab {
         let mut selected_style = self.variant.selected(cx);
         let mut disabled_style = self.variant.disabled(self.selected, cx);
         let mut hover_style = self.variant.hovered(self.selected, cx);
+        let button_states = self.button_states && self.variant == TabVariant::Outline;
+        let pressed_colors = button_states.then(|| ButtonVariant::Ghost.active(false, cx));
+        if button_states {
+            normal_style = normal_style.with_button_colors(ButtonVariant::Default.normal(true, cx));
+            selected_style = selected_style.with_button_colors(ButtonVariant::Default.selected(true, cx)); selected_style.bg = ButtonVariant::Ghost.selected(false, cx).bg; selected_style.border_color = cx.theme().transparent;
+            disabled_style = disabled_style.with_button_colors(ButtonVariant::Default.disabled(true, cx));
+            hover_style.bg = ButtonVariant::Ghost.hovered(false, cx).bg;
+        }
         if self.disabled {
-            hover_style = self.variant.disabled(self.selected, cx);
+            hover_style = if button_states {
+                self.variant.disabled(self.selected, cx).with_button_colors(ButtonVariant::Default.disabled(true, cx))
+            } else {
+                self.variant.disabled(self.selected, cx)
+            };
         }
         let tab_bar_prefix = self.tab_bar_prefix.unwrap_or_default();
         if !tab_bar_prefix {
@@ -641,8 +672,8 @@ impl RenderOnce for Tab {
         } else {
             &normal_style
         };
-        let radius = self.variant.radius(self.size, cx);
-        let inner_radius = self.variant.inner_radius(self.size, cx);
+        let radius = if button_states { cx.theme().radius } else { self.variant.radius(self.size, cx) };
+        let inner_radius = if button_states { cx.theme().radius } else { self.variant.inner_radius(self.size, cx) };
         let inner_paddings = self.variant.inner_paddings(self.size);
         let inner_margins = self.variant.inner_margins(self.size);
         let inner_height = self.variant.inner_height(self.size);
@@ -730,7 +761,11 @@ impl RenderOnce for Tab {
                     .map(|this| match (self.label, max_width) {
                         // Text always takes its natural width, so it needs a box
                         // that is allowed to shrink to ellipsize inside of.
-                        (Some(label), Some(_)) => this.child(div().truncate().child(label)),
+                        (Some(label), Some(_)) => this.child(div()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(label)),
                         (Some(label), None) => this.child(label),
                         (None, _) => this,
                     })
@@ -824,6 +859,14 @@ impl RenderOnce for Tab {
                     .border_b(hover_style.borders.bottom)
                     .border_color(hover_style.border_color)
                     .rounded(radius)
+            })
+            .when_some(pressed_colors, |this, colors| {
+                this.active(|style| {
+                    if self.selected || self.disabled {
+                        return style;
+                    }
+                    style.bg(colors.bg).text_color(colors.fg)
+                })
             })
             .when(has_inline_inner_bg, |this| {
                 this.child(

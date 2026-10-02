@@ -2,7 +2,7 @@ use std::{ops::Range, rc::Rc};
 
 use gpui::{Bounds, Half, Pixels, ShapedLine, TextAlign, px};
 
-use super::{WrappingIndent, display_map::LineLayout};
+use super::{ResolvedTextareaRotation, WrappingIndent, display_map::LineLayout};
 
 #[derive(Clone, Default)]
 pub(crate) struct WhitespaceIndicators {
@@ -25,6 +25,7 @@ pub(super) struct LastLayout {
     pub(super) cursor_bounds: Option<Bounds<Pixels>>,
     pub(super) text_align: TextAlign,
     pub(super) content_width: Pixels,
+    pub(super) textarea_rotation: Option<ResolvedTextareaRotation>,
 }
 
 impl LastLayout {

@@ -632,9 +632,8 @@ impl RenderOnce for Button {
                 this.child(
                     div()
                         .min_w_0()
-                        .overflow_hidden()
                         .whitespace_nowrap()
-                        .truncate()
+                        .text_ellipsis()
                         .line_height(relative(1.))
                         .child(label),
                 )
@@ -746,10 +745,10 @@ impl RenderOnce for Button {
     }
 }
 
-struct ButtonVariantStyle {
-    bg: Background,
-    border: Hsla,
-    fg: Hsla,
+pub(crate) struct ButtonVariantStyle {
+    pub(crate) bg: Background,
+    pub(crate) border: Hsla,
+    pub(crate) fg: Hsla,
     underline: bool,
     shadow: bool,
 }
@@ -962,7 +961,7 @@ impl ButtonVariant {
         }
     }
 
-    fn normal(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
+    pub(crate) fn normal(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         let bg = self.bg_color(outline, cx);
         let border = self.border_color(outline, cx);
         let fg = self.text_color(outline, cx);
@@ -978,7 +977,7 @@ impl ButtonVariant {
         }
     }
 
-    fn hovered(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
+    pub(crate) fn hovered(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         let bg: Background = match self {
             Self::Default => {
                 if outline {
@@ -1059,7 +1058,7 @@ impl ButtonVariant {
         }
     }
 
-    fn active(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
+    pub(crate) fn active(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         let bg = match self {
             Self::Default => {
                 if outline {
@@ -1138,7 +1137,7 @@ impl ButtonVariant {
         }
     }
 
-    fn selected(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
+    pub(crate) fn selected(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         if outline {
             let active_style = self.active(outline, cx);
 
@@ -1180,7 +1179,7 @@ impl ButtonVariant {
         }
     }
 
-    fn disabled(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
+    pub(crate) fn disabled(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         let bg = match self {
             Self::Default | Self::Link | Self::Ghost | Self::Text => cx.theme().transparent.into(),
             Self::Primary => cx.theme().tokens.button_primary.background.opacity(0.15),

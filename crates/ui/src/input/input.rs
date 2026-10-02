@@ -3,8 +3,9 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AccessibleAction, AnyElement, App, DefiniteLength, Edges, Entity, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Rems, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, Window, div, px, relative,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, Window, div,
+    px, relative,
 };
 
 use crate::button::{Button, ButtonRounded, ButtonVariants as _};
@@ -19,7 +20,7 @@ use gpui_base::InputBase as BaseInput;
 use rust_i18n::t;
 
 use super::state::{TextInputState, sync_focused_input_registry};
-use super::{InputContentType, InputState, sync_native_content_type};
+use super::{InputContentType, InputState, TextareaRotation, sync_native_content_type};
 use crate::ThemeStyled as _;
 
 fn accessibility_role(
@@ -126,6 +127,8 @@ pub struct Input {
     role: RoleOverride,
     accessibility_id: Option<SharedString>,
     aria_label: Option<SharedString>,
+    editor_paddings: Option<Edges<Pixels>>,
+    textarea_rotation: Option<TextareaRotation>,
 
     /// An optional context menu builder to allow a custom context menu on the input.
     ///
@@ -197,6 +200,8 @@ impl Input {
             role: RoleOverride::default(),
             accessibility_id: None,
             aria_label: None,
+            editor_paddings: None,
+            textarea_rotation: None,
             context_menu_builder: None,
         }
     }
@@ -243,6 +248,16 @@ impl Input {
     /// Set the bordered for the input, default: true
     pub fn bordered(mut self, bordered: bool) -> Self {
         self.bordered = bordered;
+        self
+    }
+
+    pub(crate) fn editor_paddings(mut self, paddings: Edges<Pixels>) -> Self {
+        self.editor_paddings = Some(paddings);
+        self
+    }
+
+    pub(crate) fn textarea_rotation(mut self, rotation: Option<TextareaRotation>) -> Self {
+        self.textarea_rotation = rotation;
         self
     }
 
@@ -409,18 +424,21 @@ impl RenderOnce for Input {
             cx,
         );
         state.set_editor_paddings(
-            if state.presentation(cx).is_multi_line() {
-                Edges {
-                    top: self.size.input_py(),
-                    right: self.size.input_px(),
-                    bottom: self.size.input_py(),
-                    left: self.size.input_px(),
+            self.editor_paddings.unwrap_or_else(|| {
+                if state.presentation(cx).is_multi_line() {
+                    Edges {
+                        top: self.size.input_py(),
+                        right: self.size.input_px(),
+                        bottom: self.size.input_py(),
+                        left: self.size.input_px(),
+                    }
+                } else {
+                    Edges::default()
                 }
-            } else {
-                Edges::default()
-            },
+            }),
             cx,
         );
+        state.set_textarea_rotation(self.textarea_rotation, cx);
         state.set_disabled(self.disabled, cx);
         state.set_readonly(self.readonly, cx);
         state.set_text_align(text_align, cx);
@@ -481,6 +499,12 @@ impl RenderOnce for Input {
         let disabled = self.disabled;
         let is_multi_line = presentation.is_multi_line();
         let accessibility_role = accessibility_role(is_multi_line, content_type, self.role);
+        let rotation_accessibility_enabled = window.is_a11y_active()
+            && self.textarea_rotation.is_some()
+            && accessibility_role.is_some()
+            && exposes_accessibility_value(presentation.is_masked(), content_type);
+        state.set_rotation_accessibility_enabled(rotation_accessibility_enabled, cx);
+        let rotation_accessibility_text_runs = state.rotation_accessibility_text_runs(cx);
         let accessibility_state = state.clone();
         // Materializing the whole rope is only observable through the
         // accessibility tree, so skip it when no client is listening.
@@ -557,6 +581,9 @@ impl RenderOnce for Input {
                 this.aria_placeholder(placeholder)
             })
             .when_some(accessibility_value, |this, value| this.aria_value(value))
+            .when(rotation_accessibility_enabled, |this| {
+                this.a11y_synthetic_children(rotation_accessibility_text_runs)
+            })
             .when(!disabled, |this| {
                 this.on_a11y_action(AccessibleAction::SetValue, move |data, window, cx| {
                     Self::handle_accessibility_set_value(&accessibility_state, data, window, cx);

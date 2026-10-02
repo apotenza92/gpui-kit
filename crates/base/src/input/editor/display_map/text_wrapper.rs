@@ -3,7 +3,8 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px, size,
+    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, TransformationMatrix,
+    Window, point, px, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -765,6 +766,52 @@ impl LineLayout {
             }
         }
     }
+
+    pub(crate) fn paint_transformed(
+        &self,
+        pos: Point<Pixels>,
+        line_height: Pixels,
+        text_align: TextAlign,
+        align_width: Option<Pixels>,
+        transformation: TransformationMatrix,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for (ix, line) in self.wrapped_lines.iter().enumerate() {
+            _ = line.paint_transformed(
+                pos + point(self.line_indent(ix), ix * line_height),
+                line_height,
+                text_align,
+                align_width,
+                transformation,
+                window,
+                cx,
+            );
+        }
+
+        if let Some(indicators) = self.whitespace_indicators.as_ref() {
+            for (line_index, x_position, is_tab) in &self.whitespace_chars {
+                let invisible = if *is_tab {
+                    indicators.tab.clone()
+                } else {
+                    indicators.space.clone()
+                };
+                let origin = point(
+                    pos.x + *x_position + self.line_indent(*line_index),
+                    pos.y + *line_index as f32 * line_height,
+                );
+                _ = invisible.paint_transformed(
+                    origin,
+                    line_height,
+                    text_align,
+                    align_width,
+                    transformation,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1144,6 +1191,7 @@ mod tests {
             cursor_bounds: None,
             text_align: TextAlign::Left,
             content_width: px(0.),
+            textarea_rotation: None,
         };
 
         assert_eq!(
@@ -1348,6 +1396,7 @@ mod tests {
             cursor_bounds: None,
             text_align: TextAlign::Left,
             content_width: px(0.),
+            textarea_rotation: None,
         };
 
         assert_eq!(

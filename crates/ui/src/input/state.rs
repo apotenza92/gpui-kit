@@ -107,6 +107,45 @@ impl TextInputState {
             .update(cx, |state, _| state.set_editor_paddings(paddings)))
     }
 
+    pub(crate) fn set_textarea_rotation(
+        &self,
+        rotation: Option<gpui_base::input::TextareaRotation>,
+        cx: &mut App,
+    ) {
+        match self {
+            Self::Textarea(state) => state.update(cx, |state, _| {
+                state.set_textarea_rotation(rotation);
+            }),
+            Self::Input(_) | Self::Editor(_) => {
+                debug_assert!(rotation.is_none(), "only Textarea supports editor rotation");
+            }
+        }
+    }
+
+    pub(crate) fn set_rotation_accessibility_enabled(&self, enabled: bool, cx: &mut App) {
+        match self {
+            Self::Textarea(state) => state.update(cx, |state, _| {
+                state.set_rotation_accessibility_enabled(enabled);
+            }),
+            Self::Input(_) | Self::Editor(_) => {
+                debug_assert!(
+                    !enabled,
+                    "only rotated Textarea exposes this accessibility subtree"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn rotation_accessibility_text_runs(
+        &self,
+        cx: &App,
+    ) -> Box<dyn FnOnce(&mut gpui::A11ySubtreeBuilder) + 'static> {
+        match self {
+            Self::Textarea(state) => state.read(cx).rotation_accessibility_text_runs(),
+            Self::Input(_) | Self::Editor(_) => Box::new(|_| {}),
+        }
+    }
+
     pub(crate) fn ensure_highlighter_factory(
         &self,
         factory: gpui_base::input::InputHighlighterFactory,

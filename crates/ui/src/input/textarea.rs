@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, DefiniteLength, Entity, IntoElement, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, prelude::FluentBuilder as _,
+    App, DefiniteLength, Edges, Entity, IntoElement, Pixels, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
 
-use super::{Input, TextareaState};
+use super::{Input, TextareaRotation, TextareaState};
 use crate::native_menu::NativeMenu;
 use crate::{RoleOverride, StyledExt as _};
 
@@ -22,6 +22,8 @@ pub struct Textarea {
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
+    editor_paddings: Option<Edges<Pixels>>,
+    rotation: Option<TextareaRotation>,
 
     /// An optional context menu builder to allow a custom context menu.
     ///
@@ -42,6 +44,8 @@ impl Textarea {
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
+            editor_paddings: None,
+            rotation: None,
             context_menu_builder: None,
         }
     }
@@ -58,6 +62,21 @@ impl Textarea {
 
     pub fn bordered(mut self, bordered: bool) -> Self {
         self.bordered = bordered;
+        self
+    }
+
+    /// Override the internal editor padding used for multiline text layout.
+    pub fn editor_paddings(mut self, paddings: Edges<Pixels>) -> Self {
+        self.editor_paddings = Some(paddings);
+        self
+    }
+
+    /// Rotate the editor content clockwise around its centre.
+    ///
+    /// The enclosing element must use [`TextareaRotation::frame_size`] while text layout retains
+    /// the rotation's untransformed content size.
+    pub fn rotation(mut self, rotation: TextareaRotation) -> Self {
+        self.rotation = Some(rotation);
         self
     }
 
@@ -119,6 +138,10 @@ impl RenderOnce for Textarea {
             .readonly(self.readonly)
             .tab_index(self.tab_index)
             .role(self.role)
+            .textarea_rotation(self.rotation)
+            .when_some(self.editor_paddings, |this, paddings| {
+                this.editor_paddings(paddings)
+            })
             .when_some(self.height, |this, height| this.h(height))
             .when_some(self.aria_label, |this, label| this.aria_label(label))
             .when_some(self.context_menu_builder, |this, build| {
