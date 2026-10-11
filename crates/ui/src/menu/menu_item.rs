@@ -284,7 +284,7 @@ mod tests {
         element.write_a11y_info(&mut node);
 
         assert_eq!(node.label(), Some("Fit Width"));
-        assert!(node.is_selected());
+        assert_eq!(node.is_selected(), Some(true));
         assert!(node.is_disabled());
         assert_eq!(node.toggled(), Some(gpui::accesskit::Toggled::True));
     }
