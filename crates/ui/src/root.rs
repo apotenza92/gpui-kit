@@ -320,6 +320,13 @@ impl Root {
             .and_then(|h| h.upgrade())
     }
 
+    /// The top active Dialog's focus handle.
+    pub(crate) fn active_dialog_focus_handle(&self) -> Option<FocusHandle> {
+        self.active_dialogs
+            .last()
+            .map(|dialog| dialog.focus_handle.clone())
+    }
+
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Root>) {
         if let Some(handle) = self.close_dialog_internal() {
             window.focus(&handle, cx);
@@ -639,5 +646,22 @@ mod tests {
             Root::new(view, window, cx).bordered(false).bordered(true)
         });
         assert!(root.read_with(cx, |root, _| root.bordered));
+    }
+
+    #[gpui::test]
+    fn focus_active_dialog_returns_focus_to_the_top_dialog(cx: &mut TestAppContext) {
+        use crate::WindowExt as _;
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|_| TestView);
+            Root::new(view, window, cx)
+        });
+        assert!(!cx.update(|window, cx| window.focus_active_dialog(cx)));
+        let outside = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| window.open_dialog(cx, |dialog, _, _| dialog));
+        let dialog_focus = cx.update(|window, cx| window.focused(cx)).unwrap();
+        cx.update(|window, cx| outside.focus(window, cx));
+        assert!(cx.update(|window, cx| window.focus_active_dialog(cx)));
+        assert_eq!(cx.update(|window, cx| window.focused(cx)), Some(dialog_focus));
     }
 }

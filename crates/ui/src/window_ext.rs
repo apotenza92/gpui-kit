@@ -55,6 +55,12 @@ pub trait WindowExt: Sized {
     /// Return true, if there is an active Dialog.
     fn has_active_dialog(&mut self, cx: &mut App) -> bool;
 
+    /// Moves focus to the top active Dialog, returning false when none is
+    /// open. For an app restoring focus that was lost while a Dialog stays
+    /// open (its focused control removed, or a closed Dialog's return target
+    /// gone), so the Dialog's Escape, Cancel and Tab keep reaching it.
+    fn focus_active_dialog(&mut self, cx: &mut App) -> bool;
+
     /// Closes the last active Dialog.
     fn close_dialog(&mut self, cx: &mut App);
 
@@ -160,6 +166,14 @@ impl WindowExt for Window {
     #[inline]
     fn has_active_dialog(&mut self, cx: &mut App) -> bool {
         Root::read(self, cx).active_dialogs.len() > 0
+    }
+
+    fn focus_active_dialog(&mut self, cx: &mut App) -> bool {
+        let Some(focus_handle) = Root::read(self, cx).active_dialog_focus_handle() else {
+            return false;
+        };
+        focus_handle.focus(self, cx);
+        true
     }
 
     #[inline]
