@@ -308,7 +308,10 @@ impl RenderOnce for Checkbox {
                 this.child(
                     v_flex()
                         .flex_1()
-                        .overflow_hidden()
+                        // Shrinks to wrap a long label without clipping it:
+                        // the label's line height is one, so descenders
+                        // (Segoe UI's especially) hang below its box.
+                        .min_w_0()
                         .line_height(relative(1.2))
                         .gap_1()
                         .map(|this| {
