@@ -602,6 +602,10 @@ impl RenderOnce for Dialog {
                                     .top(y)
                                     .w(self.props.width)
                                     .when_some(self.props.max_width, |this, w| this.max_w(w))
+                                    // Within the window, so a tall dialog's body
+                                    // scrolls and its title and footer stay on
+                                    // screen in a short window.
+                                    .max_h(view_size.height - px(32.))
                                     .on_prepaint({
                                         let measured_height = measured_height.clone();
                                         move |bounds, _, cx| {
