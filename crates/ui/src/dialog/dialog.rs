@@ -518,7 +518,10 @@ impl RenderOnce for Dialog {
             }
             (None, None) => (view_size.height / 10.).max(top_inset + px(16.)) + layer_offset,
         };
-        let x = view_size.width / 2. - self.props.width / 2.;
+        // Measured from the window's visible edge: the layer starts at the
+        // viewport's corner, outside a client-side shadow's margin.
+        let y = y + window_paddings.top;
+        let x = window_paddings.left + view_size.width / 2. - self.props.width / 2.;
 
         let base_size = window.text_style().font_size;
         let rem_size = window.rem_size();
