@@ -504,10 +504,19 @@ impl RenderOnce for Dialog {
             |_, _| None::<Pixels>,
         );
         let layer_offset = px(layer_ix as f32 * 16.);
+        // Below a title bar drawn in the window (as `TitleBar` draws it
+        // outside macOS), which stays visible and draggable.
+        let top_inset = if cfg!(target_os = "macos") {
+            px(0.)
+        } else {
+            TITLE_BAR_HEIGHT
+        };
         let y = match (self.props.margin_top, *measured_height.read(cx)) {
             (Some(margin_top), _) => margin_top + layer_offset,
-            (None, Some(height)) => ((view_size.height - height) / 2.).max(px(16.)) + layer_offset,
-            (None, None) => view_size.height / 10. + layer_offset,
+            (None, Some(height)) => {
+                ((view_size.height - height) / 2.).max(top_inset + px(16.)) + layer_offset
+            }
+            (None, None) => (view_size.height / 10.).max(top_inset + px(16.)) + layer_offset,
         };
         let x = view_size.width / 2. - self.props.width / 2.;
 
@@ -605,7 +614,7 @@ impl RenderOnce for Dialog {
                                     // Within the window, so a tall dialog's body
                                     // scrolls and its title and footer stay on
                                     // screen in a short window.
-                                    .max_h(view_size.height - px(32.))
+                                    .max_h(view_size.height - top_inset - px(32.))
                                     .on_prepaint({
                                         let measured_height = measured_height.clone();
                                         move |bounds, _, cx| {
