@@ -253,6 +253,9 @@ pub struct Dialog {
     pub(crate) selection_scope: TextSelectionScopeId,
 }
 
+/// The debug selector of a dialog's top-right X, for tests to find it.
+pub const DIALOG_CLOSE_BUTTON_SELECTOR: &str = "dialog-close-button";
+
 pub(crate) fn overlay_color(overlay: bool, cx: &App) -> Hsla {
     if !overlay {
         return hsla(0., 0., 0., 0.);
@@ -577,7 +580,19 @@ impl RenderOnce for Dialog {
                                     div()
                                         .absolute()
                                         .size_full()
-                                        .window_control_area(WindowControlArea::Drag)
+                                        // Only the title bar strip still moves
+                                        // the window (on Windows, where control
+                                        // areas act); a press elsewhere on the
+                                        // backdrop dismisses the dialog.
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .w_full()
+                                                .h(TITLE_BAR_HEIGHT)
+                                                .window_control_area(WindowControlArea::Drag),
+                                        )
                                         .when(self.props.overlay_visible, |overlay| {
                                             overlay.bg(overlay_color(true, cx))
                                         }),
@@ -692,6 +707,9 @@ impl RenderOnce for Dialog {
                                             .right(right)
                                             .child(
                                                 Button::new("close")
+                                                    .debug_selector(|| {
+                                                        DIALOG_CLOSE_BUTTON_SELECTOR.into()
+                                                    })
                                                     .small()
                                                     .ghost()
                                                     .icon(IconName::Close),

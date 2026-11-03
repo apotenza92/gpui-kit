@@ -543,7 +543,14 @@ impl RenderOnce for Dialog {
                         let closed = self.on_close.clone();
                         let request_close = request_close.clone();
                         this.child(
+                            // Covers the host, so a press anywhere outside the
+                            // popup reaches it; the backdrop inside is absolute
+                            // and gives this wrapper no size of its own.
                             div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
                                 .on_any_mouse_down(move |event, window, cx| {
                                     if event.position.y < dismiss_below_y {
                                         return;
