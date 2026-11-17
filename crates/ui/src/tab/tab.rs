@@ -22,7 +22,7 @@ pub enum TabVariant {
 }
 
 impl TabVariant {
-    fn height(&self, size: Size) -> Pixels {
+    pub(super) fn height(&self, size: Size) -> Pixels {
         match size {
             Size::XSmall => match self {
                 TabVariant::Underline => px(26.),

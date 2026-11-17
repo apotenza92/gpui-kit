@@ -375,20 +375,13 @@ impl RenderOnce for TabBar {
                 let padding = Edges::all(px(0.));
                 (cx.theme().transparent.into(), padding, px(4.))
             }
-            TabVariant::Segmented => {
-                let padding_x = match self.size {
-                    Size::XSmall => px(2.),
-                    Size::Small => px(3.),
-                    _ => px(4.),
-                };
-                let padding = Edges {
-                    left: padding_x,
-                    right: padding_x,
-                    ..Default::default()
-                };
-
-                (cx.theme().tokens.tab_bar_segmented.into(), padding, px(2.))
-            }
+            // The segmented track's inset is inside the tabs' clip (see
+            // `segmented_inset`), so the active tab's shadow is not cut off.
+            TabVariant::Segmented => (
+                cx.theme().tokens.tab_bar_segmented.into(),
+                Edges::all(px(0.)),
+                px(2.),
+            ),
             TabVariant::Underline => {
                 // This gap is same as the tab inner_paddings
                 let gap = match self.size {
@@ -429,6 +422,21 @@ impl RenderOnce for TabBar {
         let indicator_ready = indicator_element.is_some();
 
         let has_suffix_or_menu = self.suffix.is_some() || self.menu;
+        // The room around segmented tabs, inside the tabs' clip: the track's
+        // inset beside them, and room above and below for the active tab's
+        // shadow, which the clip would otherwise cut off square. Spacers and a
+        // height make it, not padding, which a scroll container counts twice
+        // in its scrollable width.
+        let segmented_inset = (self.variant == TabVariant::Segmented).then(|| {
+            let inset_x = match self.size {
+                Size::XSmall => px(2.),
+                Size::Small => px(3.),
+                _ => px(4.),
+            };
+            let height = self.variant.height(self.size) + px(4.);
+            (inset_x - gap, height)
+        });
+        let spacer = |width: Pixels| div().flex_shrink_0().w(width);
         let mut item_metas: Vec<(Option<SharedString>, Option<Icon>, bool)> = Vec::new();
         let selected_index = self.selected_index;
         let on_click = self.on_click.clone();
@@ -502,6 +510,7 @@ impl RenderOnce for TabBar {
                     h_flex()
                         .id("tabs-inner")
                         .relative()
+                        .when_some(segmented_inset, |this, (_, height)| this.h(height))
                         .gap(gap)
                         .overflow_x_scroll()
                         .lock_scroll_axis()
@@ -514,7 +523,13 @@ impl RenderOnce for TabBar {
                             })
                         })
                         .when_some(indicator_element, |this, ind| this.child(ind))
+                        .children(segmented_inset.map(|(width, _)| spacer(width)))
                         .children(rendered_tabs)
+                        .children(
+                            segmented_inset
+                                .filter(|_| !has_suffix_or_menu)
+                                .map(|(width, _)| spacer(width)),
+                        )
                         .when(has_suffix_or_menu, |this| this.child(self.last_empty_space)),
                 ),
             )
