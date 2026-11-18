@@ -81,6 +81,23 @@ impl Switch {
         self.tooltip.text = Some((tooltip.into(), None));
         self
     }
+
+    /// Set tooltip text for the switch with a key binding shown beside it,
+    /// for a shortcut that no action is bound to.
+    pub fn tooltip_with_key_binding(
+        mut self,
+        tooltip: impl Into<SharedString>,
+        key_binding: crate::kbd::Kbd,
+    ) -> Self {
+        let tooltip = tooltip.into();
+        self.tooltip.text = Some((tooltip.clone(), None));
+        self.tooltip.builder = Some(std::rc::Rc::new(move |window, cx| {
+            crate::tooltip::Tooltip::new(tooltip.clone())
+                .key_binding(Some(key_binding.clone()))
+                .build(window, cx)
+        }));
+        self
+    }
 }
 
 impl Styled for Switch {

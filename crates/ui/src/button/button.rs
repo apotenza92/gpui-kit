@@ -6,6 +6,7 @@ use crate::{
     StyleSized, StyledExt,
     button::ButtonIcon,
     h_flex,
+    kbd::Kbd,
     select::Caret,
     tooltip::{ManagedTooltipExt as _, Tooltip},
 };
@@ -323,6 +324,23 @@ impl Button {
     /// Set the tooltip of the button.
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
         self.tooltip = Some((tooltip.into(), None));
+        self
+    }
+
+    /// Set the tooltip of the button with a key binding shown beside it, for
+    /// a shortcut that no action is bound to.
+    pub fn tooltip_with_key_binding(
+        mut self,
+        tooltip: impl Into<SharedString>,
+        key_binding: Kbd,
+    ) -> Self {
+        let tooltip = tooltip.into();
+        self.tooltip = Some((tooltip.clone(), None));
+        self.tooltip_builder = Some(Rc::new(move |window, cx| {
+            Tooltip::new(tooltip.clone())
+                .key_binding(Some(key_binding.clone()))
+                .build(window, cx)
+        }));
         self
     }
 
@@ -1418,6 +1436,18 @@ mod tests {
 
         assert_eq!(parent_clicks.get(), 0);
         cx.update(|window, cx| assert!(window.focused(cx).is_some()));
+    }
+
+    #[gpui::test]
+    fn test_tooltip_with_key_binding(_cx: &mut gpui::TestAppContext) {
+        let stroke = gpui::Keystroke::parse("shift-t").unwrap();
+        let button =
+            Button::new("shortcut-button").tooltip_with_key_binding("Text", Kbd::new(stroke));
+        assert_eq!(
+            button.tooltip.as_ref().map(|(text, _)| text.clone()),
+            Some("Text".into())
+        );
+        assert!(button.tooltip_builder.is_some());
     }
 
     #[gpui::test]
