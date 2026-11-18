@@ -281,22 +281,43 @@ impl ParentElement for ResizablePanel {
 }
 
 impl RenderOnce for ResizablePanel {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        if !self.visible {
-            return div().id(("resizable-panel", self.panel_ix));
-        }
-
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = self
             .state
             .expect("BUG: The `state` in ResizablePanel should be present.");
+        // Showing and hiding use the stock Sidebar's offcanvas motion: the
+        // panel's slot grows or shrinks while its content keeps its width.
+        let now = cx.background_executor().now();
+        let (shown, moving) = state.update(cx, |state, cx| {
+            let reduce_motion = cx.reduce_motion();
+            state
+                .panels
+                .get_mut(self.panel_ix)
+                .map(|panel| panel.visibility.sample(self.visible, now, reduce_motion))
+                .unwrap_or((if self.visible { 1. } else { 0. }, false))
+        });
+        if moving {
+            window.request_animation_frame();
+        }
+        if shown <= 0. {
+            return div()
+                .id(("resizable-panel", self.panel_ix))
+                .into_any_element();
+        }
+        let is_last = state.read(cx).panels.len() == self.panel_ix + 1;
         let panel_state = state
             .read(cx)
             .panels
             .get(self.panel_ix)
             .expect("BUG: The `index` of ResizablePanel should be one of in `state`.");
         let size_range = self.size_range.clone();
+        let full_size = panel_state
+            .size
+            .or(self.initial_size)
+            .map(|size| size.min(size_range.end).max(size_range.start));
+        let axis = self.axis;
 
-        div()
+        let panel = div()
             .id(("resizable-panel", self.panel_ix))
             .flex()
             .flex_grow_1()
@@ -358,7 +379,33 @@ impl RenderOnce for ResizablePanel {
                             cx.new(|_| drag_panel.deref().clone())
                         }),
                 )
-            })
+            });
+
+        match full_size {
+            Some(full_size) if moving => {
+                // The slot takes the shown fraction of the panel's size; the
+                // panel keeps its full size inside it, against the group's
+                // outer edge, so its content slides rather than reflowing.
+                let slot = if axis.is_horizontal() {
+                    h_flex().h_full().w(full_size * shown)
+                } else {
+                    v_flex().w_full().h(full_size * shown)
+                };
+                slot.id(("resizable-panel-slot", self.panel_ix))
+                    .flex_none()
+                    .overflow_hidden()
+                    .when(is_last, |slot| slot.justify_end())
+                    .child(panel.flex_none().map(|panel| {
+                        if axis.is_horizontal() {
+                            panel.w(full_size).min_w(full_size)
+                        } else {
+                            panel.h(full_size).min_h(full_size)
+                        }
+                    }))
+                    .into_any_element()
+            }
+            _ => panel.into_any_element(),
+        }
     }
 }
 

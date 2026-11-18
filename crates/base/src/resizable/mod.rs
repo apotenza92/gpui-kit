@@ -1,8 +1,14 @@
-use std::ops::Range;
+use std::{ops::Range, time::Duration};
+
+use crate::animation::ease_in_out_cubic;
 
 use gpui::{
     Along, App, Axis, Bounds, Context, ElementId, EventEmitter, IsZero, Pixels, Window, px,
 };
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 mod panel;
 mod resize_handle;
@@ -392,6 +398,64 @@ pub(crate) struct ResizablePanelState {
     pub size: Option<Pixels>,
     pub size_range: Range<Pixels>,
     bounds: Bounds<Pixels>,
+    visibility: PanelVisibility,
+}
+
+/// How long a panel takes to show or hide: the stock Sidebar's offcanvas
+/// motion.
+pub(crate) const PANEL_VISIBILITY_DURATION: Duration = Duration::from_millis(200);
+
+/// A panel's show and hide motion, kept in the group's state so that it
+/// survives the panel's elements being rebuilt.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PanelVisibility {
+    visible: Option<bool>,
+    /// The shown fraction the motion started from, and when.
+    motion: Option<(f32, Instant)>,
+}
+
+impl PanelVisibility {
+    /// The panel's shown fraction at `now` (0 hidden, 1 shown) and whether it
+    /// is still moving. A panel is shown or hidden at once when it first
+    /// renders and while `reduce_motion` is set.
+    pub(crate) fn sample(
+        &mut self,
+        visible: bool,
+        now: Instant,
+        reduce_motion: bool,
+    ) -> (f32, bool) {
+        let target = if visible { 1. } else { 0. };
+        match self.visible {
+            None => {
+                self.visible = Some(visible);
+                return (target, false);
+            }
+            Some(previous) if previous != visible => {
+                let (current, _) = self.fraction(previous, now);
+                self.visible = Some(visible);
+                self.motion = (!reduce_motion).then_some((current, now));
+            }
+            _ => {}
+        }
+        if reduce_motion {
+            self.motion = None;
+        }
+        self.fraction(visible, now)
+    }
+
+    fn fraction(&mut self, visible: bool, now: Instant) -> (f32, bool) {
+        let target = if visible { 1. } else { 0. };
+        let Some((from, started)) = self.motion else {
+            return (target, false);
+        };
+        let progress = now.saturating_duration_since(started).as_secs_f32()
+            / PANEL_VISIBILITY_DURATION.as_secs_f32();
+        if progress >= 1. {
+            self.motion = None;
+            return (target, false);
+        }
+        (from + (target - from) * ease_in_out_cubic(progress), true)
+    }
 }
 
 #[cfg(test)]
@@ -404,7 +468,37 @@ mod tests {
         point, px, size,
     };
 
-    use super::{ResizableState, h_resizable, resizable_panel};
+    use super::{
+        PANEL_VISIBILITY_DURATION, PanelVisibility, ResizableState, h_resizable, resizable_panel,
+    };
+
+    #[test]
+    fn a_panel_shows_and_hides_with_the_sidebar_motion() {
+        let start = std::time::Instant::now();
+        let half = start + PANEL_VISIBILITY_DURATION / 2;
+        let end = start + PANEL_VISIBILITY_DURATION;
+        let mut panel = PanelVisibility::default();
+
+        // The first render takes its state at once.
+        assert_eq!(panel.sample(false, start, false), (0., false));
+
+        // Showing moves through the middle and arrives when the motion ends.
+        assert_eq!(panel.sample(true, start, false), (0., true));
+        let (middle, moving) = panel.sample(true, half, false);
+        assert!(moving && (middle - 0.5).abs() < 0.01, "{middle}");
+        assert_eq!(panel.sample(true, end, false), (1., false));
+
+        // Hiding part-way through starts from where the panel is.
+        panel.sample(false, end, false);
+        let (closing, _) = panel.sample(false, end + PANEL_VISIBILITY_DURATION / 4, false);
+        panel.sample(true, end + PANEL_VISIBILITY_DURATION / 4, false);
+        let (reopened, moving) = panel.sample(true, end + PANEL_VISIBILITY_DURATION / 4, false);
+        assert!(moving && (reopened - closing).abs() < 0.001);
+
+        // With reduce motion, every change takes its end state at once.
+        assert_eq!(panel.sample(false, end, true), (0., false));
+        assert_eq!(panel.sample(true, end, true), (1., false));
+    }
 
     struct ResizableHarness {
         state: gpui::Entity<ResizableState>,
