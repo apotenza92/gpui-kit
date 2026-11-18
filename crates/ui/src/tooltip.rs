@@ -105,7 +105,11 @@ impl Render for Tooltip {
             }
         };
 
-        div().child(
+        let popup = div();
+        // Scripted reviews find a shown tooltip by this selector.
+        #[cfg(feature = "test-support")]
+        let popup = gpui::InteractiveElement::debug_selector(popup, || "tooltip-popup".into());
+        popup.child(
             // Wrap in a child, to ensure the left margin is applied to the tooltip
             BaseTooltip::new("tooltip-popup")
                 .h_flex()
@@ -275,8 +279,9 @@ pub(crate) trait ManagedTooltipExt:
                             o.request_show(request, window, cx);
                         });
                     } else {
+                        let bounds = trigger_bounds_cell.get();
                         overlay.update(cx, |o: &mut BaseTooltipOverlay, cx| {
-                            o.request_hide(window, cx);
+                            o.request_hide_from(bounds, window, cx);
                         });
                     }
                 }

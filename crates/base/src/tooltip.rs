@@ -93,6 +93,8 @@ pub enum TooltipTransition {
 /// Per-window tooltip provider and overlay.
 pub struct TooltipOverlay {
     content: Option<TooltipRequest>,
+    /// The trigger whose tooltip waits for the show delay.
+    pending_bounds: Option<Bounds<Pixels>>,
     previous_bounds: Option<Bounds<Pixels>>,
     epoch: usize,
     had_recent_tooltip: bool,
@@ -107,6 +109,7 @@ impl TooltipOverlay {
     pub fn new() -> Self {
         Self {
             content: None,
+            pending_bounds: None,
             previous_bounds: None,
             epoch: 0,
             had_recent_tooltip: false,
@@ -142,6 +145,7 @@ impl TooltipOverlay {
         if was_visible || self.had_recent_tooltip {
             self.previous_bounds = self.content.as_ref().map(|content| content.trigger_bounds);
             self.content = Some(content);
+            self.pending_bounds = None;
             self.show_task = None;
             self.is_switching = was_visible;
             self.animation_epoch += 1;
@@ -150,10 +154,12 @@ impl TooltipOverlay {
         }
 
         let epoch = self.next_epoch();
+        self.pending_bounds = Some(content.trigger_bounds);
         self.show_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(SHOW_DELAY).await;
             let _ = this.update_in(cx, |this, _, cx| {
                 if this.epoch == epoch {
+                    this.pending_bounds = None;
                     this.content = Some(content);
                     this.previous_bounds = None;
                     this.is_switching = false;
@@ -164,8 +170,11 @@ impl TooltipOverlay {
         }));
     }
 
+    /// Hides the tooltip after a grace period, unless a trigger is hovered
+    /// again first.
     pub fn request_hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_task = None;
+        self.pending_bounds = None;
         if self.content.is_none() {
             return;
         }
@@ -184,6 +193,33 @@ impl TooltipOverlay {
         }));
     }
 
+    /// Hides the tooltip when the pointer leaves the trigger at
+    /// `trigger_bounds`.
+    ///
+    /// Between two adjacent triggers, the pointer can enter the next trigger
+    /// in the same event that it leaves this one, and the next trigger's
+    /// request can come first. If so, the tooltip now belongs to that trigger,
+    /// which is still under the pointer, and this request does nothing.
+    pub fn request_hide_from(
+        &mut self,
+        trigger_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer = window.mouse_position();
+        let taken_over =
+            |bounds: Bounds<Pixels>| bounds != trigger_bounds && bounds.contains(&pointer);
+        let requested = self
+            .content
+            .as_ref()
+            .map(|content| content.trigger_bounds)
+            .or(self.pending_bounds);
+        if requested.is_some_and(taken_over) {
+            return;
+        }
+        self.request_hide(window, cx);
+    }
+
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         let changed = self.content.is_some()
             || self.previous_bounds.is_some()
@@ -191,6 +227,7 @@ impl TooltipOverlay {
             || self.show_task.is_some()
             || self.hide_task.is_some();
         self.content = None;
+        self.pending_bounds = None;
         self.previous_bounds = None;
         self.had_recent_tooltip = false;
         self.is_switching = false;
@@ -299,6 +336,72 @@ mod tests {
             state.update(cx, |tooltip, cx| tooltip.hide(cx));
         });
         cx.update(|_, cx| assert!(state.read(cx).content.is_none()));
+    }
+
+    #[gpui::test]
+    fn leaving_a_trigger_keeps_the_adjacent_triggers_tooltip(cx: &mut gpui::TestAppContext) {
+        let first = bounds(0., 0., 20., 20.);
+        let next = bounds(20., 0., 20., 20.);
+        let request = |bounds| {
+            TooltipRequest::new(bounds, |_, _| {
+                panic!("content is not rendered by this lifecycle test")
+            })
+        };
+        let state = cx.update(|cx| cx.new(|_| TooltipOverlay::new()));
+        let cx = cx.add_empty_window();
+
+        // A shown tooltip: the pointer moves onto the next trigger, which
+        // asks first, then the first trigger reports that the pointer left.
+        cx.update(|window, cx| {
+            state.update(cx, |tooltip, cx| {
+                tooltip.had_recent_tooltip = true;
+                tooltip.request_show(request(first), window, cx);
+            });
+        });
+        cx.simulate_mouse_move(point(px(30.), px(10.)), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            state.update(cx, |tooltip, cx| {
+                tooltip.request_show(request(next), window, cx);
+                tooltip.request_hide_from(first, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let tooltip = state.read(cx);
+            assert_eq!(
+                tooltip.content.as_ref().map(|c| c.trigger_bounds),
+                Some(next)
+            );
+            assert!(tooltip.hide_task.is_none());
+        });
+
+        // A tooltip that waits for the show delay is not cancelled either.
+        cx.update(|window, cx| {
+            state.update(cx, |tooltip, cx| {
+                tooltip.hide(cx);
+                tooltip.request_show(request(next), window, cx);
+                tooltip.request_hide_from(first, window, cx);
+            });
+        });
+        cx.update(|_, cx| {
+            let tooltip = state.read(cx);
+            assert!(tooltip.show_task.is_some());
+            assert_eq!(tooltip.pending_bounds, Some(next));
+        });
+
+        // When the pointer leaves the trigger that owns the tooltip, the
+        // request ends.
+        cx.simulate_mouse_move(point(px(100.), px(100.)), None, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            state.update(cx, |tooltip, cx| {
+                tooltip.request_hide_from(next, window, cx)
+            });
+        });
+        cx.update(|_, cx| {
+            let tooltip = state.read(cx);
+            assert!(tooltip.show_task.is_none());
+            assert!(tooltip.pending_bounds.is_none());
+        });
     }
 
     #[test]
