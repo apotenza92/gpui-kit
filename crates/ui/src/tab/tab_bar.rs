@@ -61,6 +61,9 @@ pub struct TabBar {
     size: Size,
     menu: bool,
     max_width: Option<Pixels>,
+    tab_height: Option<Pixels>,
+    inset: Option<Pixels>,
+    tab_gap: Option<Pixels>,
     on_click: Option<Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
 }
 
@@ -83,7 +86,31 @@ impl TabBar {
             on_click: None,
             menu: false,
             max_width: None,
+            tab_height: None,
+            inset: None,
+            tab_gap: None,
         }
+    }
+
+    /// Set the space between segmented tabs. Default is the size's gap.
+    pub fn tab_gap(mut self, gap: impl Into<Pixels>) -> Self {
+        self.tab_gap = Some(gap.into());
+        self
+    }
+
+    /// Set the height of each tab's raised area, for example to match the
+    /// buttons beside the bar. Default is the size's height.
+    pub fn tab_height(mut self, height: impl Into<Pixels>) -> Self {
+        self.tab_height = Some(height.into());
+        self
+    }
+
+    /// Set the segmented track's inset before the first tab and after the
+    /// last, for example to match the room above and below the tabs.
+    /// Default is the size's inset.
+    pub fn inset(mut self, inset: impl Into<Pixels>) -> Self {
+        self.inset = Some(inset.into());
+        self
     }
 
     /// Set the Tab variant, all children will inherit the variant.
@@ -248,7 +275,9 @@ impl TabBar {
 
         let variant = self.variant;
         let size = self.size;
-        let inner_height = variant.inner_height(size);
+        let inner_height = self
+            .tab_height
+            .unwrap_or_else(|| variant.inner_height(size));
         let inner_radius = variant.inner_radius(size, cx);
 
         let indicator = div()
@@ -380,7 +409,7 @@ impl RenderOnce for TabBar {
             TabVariant::Segmented => (
                 cx.theme().tokens.tab_bar_segmented.into(),
                 Edges::all(px(0.)),
-                px(2.),
+                self.tab_gap.unwrap_or(px(2.)),
             ),
             TabVariant::Underline => {
                 // This gap is same as the tab inner_paddings
@@ -428,12 +457,18 @@ impl RenderOnce for TabBar {
         // height make it, not padding, which a scroll container counts twice
         // in its scrollable width.
         let segmented_inset = (self.variant == TabVariant::Segmented).then(|| {
-            let inset_x = match self.size {
+            let inset_x = self.inset.unwrap_or(match self.size {
                 Size::XSmall => px(2.),
                 Size::Small => px(3.),
                 _ => px(4.),
-            };
-            let height = self.variant.height(self.size) + px(4.);
+            });
+            let tab_height = self.tab_height.map_or_else(
+                || self.variant.height(self.size),
+                |raised| {
+                    raised + self.variant.height(self.size) - self.variant.inner_height(self.size)
+                },
+            );
+            let height = tab_height + px(4.);
             (inset_x - gap, height)
         });
         let spacer = |width: Pixels| div().flex_shrink_0().w(width);
@@ -455,6 +490,7 @@ impl RenderOnce for TabBar {
                 .with_size(self.size);
             tab.indicator_active = has_indicator;
             tab.indicator_ready = indicator_ready;
+            tab.raised_height = self.tab_height;
             tab.indicator_epoch = indicator_epoch;
             let tab = tab
                 .when_some(selected_index, |tab, selected_index| {

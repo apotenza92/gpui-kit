@@ -426,6 +426,8 @@ pub struct Tab {
     /// restarts in sync with the indicator slide.
     pub(super) indicator_epoch: u64,
     pub(super) max_width: Option<Pixels>,
+    /// The raised area's height, from [`super::TabBar::tab_height`].
+    pub(super) raised_height: Option<Pixels>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -480,6 +482,7 @@ impl Default for Tab {
             button_states: false,
             size: Size::default(),
             max_width: None,
+            raised_height: None,
             on_click: None,
         }
     }
@@ -645,13 +648,19 @@ impl RenderOnce for Tab {
         let pressed_colors = button_states.then(|| ButtonVariant::Ghost.active(false, cx));
         if button_states {
             normal_style = normal_style.with_button_colors(ButtonVariant::Default.normal(true, cx));
-            selected_style = selected_style.with_button_colors(ButtonVariant::Default.selected(true, cx)); selected_style.bg = ButtonVariant::Ghost.selected(false, cx).bg; selected_style.border_color = cx.theme().transparent;
-            disabled_style = disabled_style.with_button_colors(ButtonVariant::Default.disabled(true, cx));
+            selected_style =
+                selected_style.with_button_colors(ButtonVariant::Default.selected(true, cx));
+            selected_style.bg = ButtonVariant::Ghost.selected(false, cx).bg;
+            selected_style.border_color = cx.theme().transparent;
+            disabled_style =
+                disabled_style.with_button_colors(ButtonVariant::Default.disabled(true, cx));
             hover_style.bg = ButtonVariant::Ghost.hovered(false, cx).bg;
         }
         if self.disabled {
             hover_style = if button_states {
-                self.variant.disabled(self.selected, cx).with_button_colors(ButtonVariant::Default.disabled(true, cx))
+                self.variant
+                    .disabled(self.selected, cx)
+                    .with_button_colors(ButtonVariant::Default.disabled(true, cx))
             } else {
                 self.variant.disabled(self.selected, cx)
             };
@@ -672,12 +681,24 @@ impl RenderOnce for Tab {
         } else {
             &normal_style
         };
-        let radius = if button_states { cx.theme().radius } else { self.variant.radius(self.size, cx) };
-        let inner_radius = if button_states { cx.theme().radius } else { self.variant.inner_radius(self.size, cx) };
+        let radius = if button_states {
+            cx.theme().radius
+        } else {
+            self.variant.radius(self.size, cx)
+        };
+        let inner_radius = if button_states {
+            cx.theme().radius
+        } else {
+            self.variant.inner_radius(self.size, cx)
+        };
         let inner_paddings = self.variant.inner_paddings(self.size);
         let inner_margins = self.variant.inner_margins(self.size);
-        let inner_height = self.variant.inner_height(self.size);
-        let height = self.variant.height(self.size);
+        let inner_height = self
+            .raised_height
+            .unwrap_or_else(|| self.variant.inner_height(self.size));
+        // The tab keeps its size's room around the raised area.
+        let height =
+            inner_height + self.variant.height(self.size) - self.variant.inner_height(self.size);
         let aria_label = self.a11y_label();
 
         let segmented_indicator_active =
@@ -761,11 +782,13 @@ impl RenderOnce for Tab {
                     .map(|this| match (self.label, max_width) {
                         // Text always takes its natural width, so it needs a box
                         // that is allowed to shrink to ellipsize inside of.
-                        (Some(label), Some(_)) => this.child(div()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(label)),
+                        (Some(label), Some(_)) => this.child(
+                            div()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        ),
                         (Some(label), None) => this.child(label),
                         (None, _) => this,
                     })
