@@ -327,6 +327,26 @@ impl Button {
         self
     }
 
+    /// Set the tooltip of the button with a muted description below its
+    /// text, and an optional key binding beside the text.
+    pub fn tooltip_with_description(
+        mut self,
+        tooltip: impl Into<SharedString>,
+        description: impl Into<SharedString>,
+        key_binding: Option<Kbd>,
+    ) -> Self {
+        let tooltip = tooltip.into();
+        let description = description.into();
+        self.tooltip = Some((tooltip.clone(), None));
+        self.tooltip_builder = Some(Rc::new(move |window, cx| {
+            Tooltip::new(tooltip.clone())
+                .key_binding(key_binding.clone())
+                .description(description.clone())
+                .build(window, cx)
+        }));
+        self
+    }
+
     /// Set the tooltip of the button with a key binding shown beside it, for
     /// a shortcut that no action is bound to.
     pub fn tooltip_with_key_binding(
@@ -1443,6 +1463,17 @@ mod tests {
         let stroke = gpui::Keystroke::parse("shift-t").unwrap();
         let button =
             Button::new("shortcut-button").tooltip_with_key_binding("Text", Kbd::new(stroke));
+        assert_eq!(
+            button.tooltip.as_ref().map(|(text, _)| text.clone()),
+            Some("Text".into())
+        );
+        assert!(button.tooltip_builder.is_some());
+    }
+
+    #[gpui::test]
+    fn test_tooltip_with_description(_cx: &mut gpui::TestAppContext) {
+        let button =
+            Button::new("described-button").tooltip_with_description("Text", "A second line", None);
         assert_eq!(
             button.tooltip.as_ref().map(|(text, _)| text.clone()),
             Some("Text".into())

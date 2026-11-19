@@ -35,6 +35,7 @@ pub struct Tooltip {
     style: StyleRefinement,
     content: TooltipContext,
     key_binding: Option<Kbd>,
+    description: Option<SharedString>,
     action: Option<(Box<dyn Action>, Option<SharedString>)>,
 }
 
@@ -45,6 +46,7 @@ impl Tooltip {
             style: StyleRefinement::default(),
             content: TooltipContext::Text(text.into()),
             key_binding: None,
+            description: None,
             action: None,
         }
     }
@@ -58,6 +60,7 @@ impl Tooltip {
         Self {
             style: StyleRefinement::default(),
             key_binding: None,
+            description: None,
             action: None,
             content: TooltipContext::Element(Box::new(move |window, cx| {
                 builder(window, cx).into_any_element()
@@ -74,6 +77,13 @@ impl Tooltip {
     /// Set KeyBinding information for the tooltip.
     pub fn key_binding(mut self, key_binding: Option<Kbd>) -> Self {
         self.key_binding = key_binding;
+        self
+    }
+
+    /// Set a muted second line below the text. The key binding then stays
+    /// beside the first line.
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -109,40 +119,56 @@ impl Render for Tooltip {
         // Scripted reviews find a shown tooltip by this selector.
         #[cfg(feature = "test-support")]
         let popup = gpui::InteractiveElement::debug_selector(popup, || "tooltip-popup".into());
+        let content = div().map(|this| match self.content {
+            TooltipContext::Text(ref text) => this.child(text.clone()),
+            TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
+        });
+        let key_binding = key_binding.map(|kbd| {
+            div()
+                .text_xs()
+                .flex_shrink_0()
+                .text_color(cx.theme().muted_foreground)
+                .child(kbd.appearance(false))
+        });
+        let tooltip = BaseTooltip::new("tooltip-popup")
+            .font_family(cx.theme().font_family.clone())
+            .m_3()
+            .bg(cx.theme().tokens.popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_md()
+            .rounded(cx.theme().radius)
+            .py_0p5()
+            .px_2()
+            .text_sm();
         popup.child(
             // Wrap in a child, to ensure the left margin is applied to the tooltip
-            BaseTooltip::new("tooltip-popup")
-                .h_flex()
-                .font_family(cx.theme().font_family.clone())
-                .m_3()
-                .bg(cx.theme().tokens.popover)
-                .text_color(cx.theme().popover_foreground)
-                .bg(cx.theme().tokens.popover)
-                .border_1()
-                .border_color(cx.theme().border)
-                .shadow_md()
-                .rounded(cx.theme().radius)
-                .justify_between()
-                .py_0p5()
-                .px_2()
-                .text_sm()
-                .gap_3()
-                .refine_style(&self.style)
-                .map(|this| {
-                    this.child(div().map(|this| match self.content {
-                        TooltipContext::Text(ref text) => this.child(text.clone()),
-                        TooltipContext::Element(ref builder) => this.child(builder(window, cx)),
-                    }))
-                })
-                .when_some(key_binding, |this, kbd| {
-                    this.child(
+            match self.description.clone() {
+                None => tooltip
+                    .h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .refine_style(&self.style)
+                    .child(content)
+                    .children(key_binding),
+                Some(description) => tooltip
+                    .v_flex()
+                    .refine_style(&self.style)
+                    .child(
                         div()
-                            .text_xs()
-                            .flex_shrink_0()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(kbd.appearance(false)),
+                            .h_flex()
+                            .justify_between()
+                            .gap_3()
+                            .child(content)
+                            .children(key_binding),
                     )
-                }),
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
+                    ),
+            },
         )
     }
 }
