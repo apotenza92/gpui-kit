@@ -347,6 +347,18 @@ impl Button {
         self
     }
 
+    /// Set the tooltip of the button to a view that `builder` makes. The
+    /// text names the button for accessibility.
+    pub fn tooltip_builder(
+        mut self,
+        tooltip: impl Into<SharedString>,
+        builder: impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static,
+    ) -> Self {
+        self.tooltip = Some((tooltip.into(), None));
+        self.tooltip_builder = Some(Rc::new(builder));
+        self
+    }
+
     /// Set the tooltip of the button with a key binding shown beside it, for
     /// a shortcut that no action is bound to.
     pub fn tooltip_with_key_binding(
@@ -1474,6 +1486,17 @@ mod tests {
     fn test_tooltip_with_description(_cx: &mut gpui::TestAppContext) {
         let button =
             Button::new("described-button").tooltip_with_description("Text", "A second line", None);
+        assert_eq!(
+            button.tooltip.as_ref().map(|(text, _)| text.clone()),
+            Some("Text".into())
+        );
+        assert!(button.tooltip_builder.is_some());
+    }
+
+    #[gpui::test]
+    fn test_tooltip_builder(_cx: &mut gpui::TestAppContext) {
+        let button = Button::new("built-tooltip-button")
+            .tooltip_builder("Text", |window, cx| Tooltip::new("Text").build(window, cx));
         assert_eq!(
             button.tooltip.as_ref().map(|(text, _)| text.clone()),
             Some("Text".into())

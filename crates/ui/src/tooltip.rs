@@ -35,7 +35,7 @@ pub struct Tooltip {
     style: StyleRefinement,
     content: TooltipContext,
     key_binding: Option<Kbd>,
-    description: Option<SharedString>,
+    description: Option<TooltipContext>,
     action: Option<(Box<dyn Action>, Option<SharedString>)>,
 }
 
@@ -82,8 +82,20 @@ impl Tooltip {
 
     /// Set a muted second line below the text. The key binding then stays
     /// beside the first line.
-    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
-        self.description = Some(description.into());
+    pub fn description(mut self, description: impl Into<Text>) -> Self {
+        self.description = Some(TooltipContext::Text(description.into()));
+        self
+    }
+
+    /// Set a custom element as the muted second line below the text.
+    pub fn description_element<E, F>(mut self, builder: F) -> Self
+    where
+        E: IntoElement,
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+    {
+        self.description = Some(TooltipContext::Element(Box::new(move |window, cx| {
+            builder(window, cx).into_any_element()
+        })));
         self
     }
 
@@ -144,7 +156,13 @@ impl Render for Tooltip {
             .text_sm();
         popup.child(
             // Wrap in a child, to ensure the left margin is applied to the tooltip
-            match self.description.clone() {
+            match self
+                .description
+                .as_ref()
+                .map(|description| match description {
+                    TooltipContext::Text(text) => text.clone().into_any_element(),
+                    TooltipContext::Element(builder) => builder(window, cx),
+                }) {
                 None => tooltip
                     .h_flex()
                     .justify_between()
