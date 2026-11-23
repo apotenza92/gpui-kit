@@ -1190,8 +1190,17 @@ impl ButtonVariant {
     pub(crate) fn selected(&self, outline: bool, cx: &mut App) -> ButtonVariantStyle {
         if outline {
             let active_style = self.active(outline, cx);
+            // A selected outline Default button (a toggle that is on, a tab)
+            // fills with its border's input colour: one step past its press,
+            // so the persistent state reads apart from hover in light and dark
+            // themes, and no ring of another colour shows round it.
+            let bg = match self {
+                Self::Default => cx.theme().input.into(),
+                _ => active_style.bg,
+            };
 
             return ButtonVariantStyle {
+                bg,
                 fg: self.text_color(outline, cx),
                 ..active_style
             };
@@ -1667,6 +1676,26 @@ mod tests {
             assert_eq!(selected_style.fg, cx.theme().danger);
             assert_ne!(selected_style.bg, cx.theme().tokens.danger_active.into());
         });
+    }
+
+    #[gpui::test]
+    fn test_outline_default_selected_is_distinct_from_hover_and_press(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let window = cx.add_empty_window();
+        for mode in [crate::ThemeMode::Light, crate::ThemeMode::Dark] {
+            window.update(|window, cx| {
+                crate::Theme::change(mode, Some(window), cx);
+                let variant = ButtonVariant::Default;
+                let selected = variant.selected(true, cx);
+                assert_eq!(selected.bg, cx.theme().input.into(), "{mode:?}");
+                assert_eq!(selected.border, cx.theme().input, "{mode:?}");
+                assert_ne!(selected.bg, variant.hovered(true, cx).bg, "{mode:?}");
+                assert_ne!(selected.bg, variant.active(true, cx).bg, "{mode:?}");
+                assert_ne!(selected.bg, variant.normal(true, cx).bg, "{mode:?}");
+            });
+        }
     }
 
     #[gpui::test]
