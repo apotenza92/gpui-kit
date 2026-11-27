@@ -379,6 +379,22 @@ impl SliderState {
         cx.notify();
     }
 
+    /// Step the value by `steps` steps, as an accessibility Increment or
+    /// Decrement does. Emit `Change` and then `Release`, so that an owner
+    /// commits the step as it commits the end of a drag.
+    #[doc(hidden)]
+    pub fn step_by_a11y(&mut self, steps: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.value.end();
+        let value = (current + steps * self.step).clamp(self.min, self.max);
+        if value == current {
+            return;
+        }
+        self.set_value(value, window, cx);
+        self.dragging = false;
+        cx.emit(SliderEvent::Change(self.value));
+        cx.emit(SliderEvent::Release(self.value));
+    }
+
     /// Emit [`SliderEvent::Release`] if the user was actively interacting
     /// with the slider. Called on mouse-up both inside and outside the slider.
     #[doc(hidden)]
@@ -487,21 +503,13 @@ impl RenderOnce for Slider {
             .on_a11y_action(AccessibleAction::Increment, {
                 let state = slider_state.clone();
                 move |_, window, cx| {
-                    state.update(cx, |state, cx| {
-                        let value =
-                            (state.value().end() + state.step_value()).min(state.max_value());
-                        state.set_value(value, window, cx);
-                    });
+                    state.update(cx, |state, cx| state.step_by_a11y(1., window, cx));
                 }
             })
             .on_a11y_action(AccessibleAction::Decrement, {
                 let state = slider_state.clone();
                 move |_, window, cx| {
-                    state.update(cx, |state, cx| {
-                        let value =
-                            (state.value().end() - state.step_value()).max(state.min_value());
-                        state.set_value(value, window, cx);
-                    });
+                    state.update(cx, |state, cx| state.step_by_a11y(-1., window, cx));
                 }
             })
             .when(!self.disabled, |this| {
